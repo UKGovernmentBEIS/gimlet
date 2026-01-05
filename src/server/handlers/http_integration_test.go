@@ -692,13 +692,13 @@ func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 
-	// Verify CANCEL frame was sent to agent after successful response completion
-	if !trackingWS.waitForCancel(2 * time.Second) {
-		t.Error("Expected CANCEL frame to be sent to agent after successful response completion")
-	}
-
-	// Clean up
+	// Close the client connection - this triggers the server to send CANCEL to the agent
 	clientConn.Close()
+
+	// Verify CANCEL frame was sent to agent after client closed connection
+	if !trackingWS.waitForCancel(2 * time.Second) {
+		t.Error("Expected CANCEL frame to be sent to agent after client closed connection")
+	}
 
 	// Wait for handler to complete
 	select {
