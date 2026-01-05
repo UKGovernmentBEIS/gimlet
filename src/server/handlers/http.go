@@ -452,9 +452,10 @@ func (h *HTTPHandler) streamResponseToTCP(
 				}
 				logger.Debug().Int("statusCode", statusCode).Msg("Request completed")
 				h.metricsTracker.IncrementWebsocketMessage("recv", "response_end")
-				// Send CANCEL to agent so it can close the backend connection immediately.
-				// Without this, agents wait for the backend's HTTP/1.1 keep-alive timeout
-				// (~60s) before cleaning up, causing inflated active request metrics.
+				// Wait for client to close connection, then send CANCEL to agent
+				// so it can clean up the backend connection immediately.
+				<-clientClosed
+				logger.Debug().Msg("Client closed connection after response")
 				if cancelErr := ag.SendHTTPRequestCancel(requestID); cancelErr != nil {
 					logger.Debug().Err(cancelErr).Msg("Failed to send cancel frame to agent")
 				}
