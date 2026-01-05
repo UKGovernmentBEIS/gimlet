@@ -1,0 +1,46 @@
+app = "gimlet-server"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[build.args]
+  VERSION = "v0.0.1"
+
+[env]
+  GIMLET_SERVER_LOG_LEVEL = "INFO"
+  GIMLET_SERVER_LOG_FORMAT = "json"
+  GIMLET_SERVER_MAX_CONCURRENT_REQUESTS = "1000"
+  GIMLET_SERVER_IDLE_TIMEOUT = "10m"
+  # Health stays on main port (8080) for Fly's http_checks
+  GIMLET_SERVER_METRICS_PORT = "9091"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 2000
+    soft_limit = 1000
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/health"
+
+[metrics]
+  port = 9091
+  path = "/metrics"

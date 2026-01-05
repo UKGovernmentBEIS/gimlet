@@ -1,0 +1,39 @@
+[project]
+name = "gimlet"
+version = "0.1.0"
+description = "Distributed tunnel-based model serving with authentication and testing tools"
+readme = "README.md"
+authors = [
+    { name = "Tom.Catling", email = "Tom.Catling@dsit.gov.uk" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=9.0.2",
+    "pytest-xdist>=3.6.1",
+    "requests>=2.32.5",
+    "docker>=7.1.0",
+    "pyjwt[crypto]>=2.9.0",
+    "cryptography>=43.0.0",
+    "click>=8.1.0",
+    "websocket-client>=1.8.0",
+    "ruff>=0.14.10",
+    "boto3>=1.35.0",
+]
+
+[project.scripts]
+gimlet = "gimlet.cli:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "disruption: tests that kill/restart containers (run separately, not in parallel)",
+    "slow: tests that take a long time to run",
+]
+addopts = "--dist loadgroup"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gimlet"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

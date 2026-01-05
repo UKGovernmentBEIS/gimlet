@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: "**/*.sum"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run Go unit tests (server)
+        working-directory: src/server
+        run: go test -race ./...
+
+      - name: Run Go unit tests (agent)
+        working-directory: src/agent
+        run: go test -race ./...
+
+      - name: Build server (with race detection)
+        working-directory: src/server
+        run: GOOS=linux GOARCH=amd64 go build -race -buildvcs=false -o ../../bin/gimlet-server-amd64 .
+
+      - name: Build agent (with race detection)
+        working-directory: src/agent
+        run: GOOS=linux GOARCH=amd64 go build -race -buildvcs=false -o ../../bin/gimlet-agent-amd64 .
+
+      - name: List built binaries
+        run: ls -lh bin/
+
+      - name: Start services (generates JWTs and test data)
+        run: make up
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for services to start..."
+          sleep 10
+          make ps
+          make logs
+
+      - name: Run Python E2E tests
+        run: make test-e2e
+
+      - name: Run Python disruption tests
+        run: make test-disruption
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          echo "=== Docker Compose Logs ==="
+          make logs
+          echo "=== Container Status ==="
+          make ps
+
+      - name: Cleanup
+        if: always()
+        run: make down-v
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: "**/*.sum"
+
+      - name: Download Go dependencies (server)
+        working-directory: src/server
+        run: go mod download
+
+      - name: Download Go dependencies (agent)
+        working-directory: src/agent
+        run: go mod download
+
+      - name: Build server (amd64)
+        working-directory: src/server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o ../../bin/gimlet-server-amd64 .
+
+      - name: Build server (arm64)
+        working-directory: src/server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o ../../bin/gimlet-server-arm64 .
+
+      - name: Build agent (amd64)
+        working-directory: src/agent
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o ../../bin/gimlet-agent-amd64 .
+
+      - name: Build agent (arm64)
+        working-directory: src/agent
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o ../../bin/gimlet-agent-arm64 .
+
+      - name: List built binaries
+        run: ls -lh bin/
+
+      - name: Create checksums
+        run: |
+          cd bin
+          sha256sum gimlet-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/gimlet-server-amd64
+            bin/gimlet-server-arm64
+            bin/gimlet-agent-amd64
+            bin/gimlet-agent-arm64
+            bin/checksums.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/src/server"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps(go)"
+
+  - package-ecosystem: "gomod"
+    directory: "/src/agent"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps(go)"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps(python)"
