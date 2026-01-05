@@ -324,6 +324,23 @@ func (h *HTTPHandler) writeHTTPError(conn net.Conn, statusCode int, message stri
 	}
 }
 
+// chunkedTerminator is the marker for end of chunked encoding: "0\r\n\r\n"
+var chunkedTerminator = []byte("0\r\n\r\n")
+
+// containsChunkedTerminator checks if the chunked encoding terminator appears
+// in the current payload, possibly spanning from the previous frame's tail.
+func containsChunkedTerminator(prevTail, payload []byte) bool {
+	// Check if terminator spans previous frame and current payload
+	if len(prevTail) > 0 {
+		combined := append(prevTail, payload...)
+		if bytes.Contains(combined, chunkedTerminator) {
+			return true
+		}
+	}
+	// Check current payload alone
+	return bytes.Contains(payload, chunkedTerminator)
+}
+
 // streamResponseToTCP streams binary frames from agent to TCP connection
 func (h *HTTPHandler) streamResponseToTCP(
 	conn net.Conn,
@@ -361,6 +378,13 @@ func (h *HTTPHandler) streamResponseToTCP(
 	headersSent := false
 	statusCode := 0
 
+	// Response body tracking - used to detect when response is complete
+	// so we can send CANCEL to agent before backend closes connection
+	var contentLength int64 = -1 // -1 means unknown/chunked
+	var isChunked bool
+	var bodyBytesReceived int64
+	var prevFrameTail []byte // Last few bytes of previous frame for chunked terminator detection
+
 	for {
 		select {
 		case frame, ok := <-respCh:
@@ -396,7 +420,7 @@ func (h *HTTPHandler) streamResponseToTCP(
 
 			switch frameType {
 			case protocol.FrameTypeStart:
-				// Parse HTTP response headers to extract status code
+				// Parse HTTP response headers to extract status code and body info
 				resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
 				if err != nil {
 					logger.Error().Err(err).Msg("Failed to parse response headers")
@@ -406,6 +430,19 @@ func (h *HTTPHandler) streamResponseToTCP(
 
 				statusCode = resp.StatusCode
 				headersSent = true
+
+				// Extract response body info for completion detection
+				contentLength = resp.ContentLength // -1 if unknown
+				isChunked = len(resp.TransferEncoding) > 0 && resp.TransferEncoding[0] == "chunked"
+
+				// Calculate body bytes in this frame (after headers)
+				// Headers end with \r\n\r\n
+				headerEnd := bytes.Index(payload, []byte("\r\n\r\n"))
+				var bodyInStart []byte
+				if headerEnd >= 0 {
+					bodyInStart = payload[headerEnd+4:]
+					bodyBytesReceived = int64(len(bodyInStart))
+				}
 
 				// Write raw response bytes (headers + any body) directly to TCP connection
 				if _, err := conn.Write(payload); err != nil {
@@ -418,14 +455,56 @@ func (h *HTTPHandler) streamResponseToTCP(
 					return statusCode
 				}
 
-				logger.Debug().Int("statusCode", resp.StatusCode).Msg("Sent response_start")
+				logger.Debug().Int("statusCode", resp.StatusCode).Int64("contentLength", contentLength).Bool("chunked", isChunked).Msg("Sent response_start")
 				h.metricsTracker.IncrementWebsocketMessage("recv", "response_start")
+
+				// Check if response is already complete
+				responseComplete := false
+
+				// No-body responses: 204 No Content, 304 Not Modified
+				if statusCode == 204 || statusCode == 304 {
+					logger.Debug().Msg("No-body response complete")
+					responseComplete = true
+				}
+
+				// Content-Length: check if we've received all bytes
+				if !responseComplete && contentLength >= 0 && bodyBytesReceived >= contentLength {
+					logger.Debug().Int64("contentLength", contentLength).Int64("received", bodyBytesReceived).Msg("Content-Length response complete")
+					responseComplete = true
+				}
+
+				// Chunked: check for terminator in body portion
+				if !responseComplete && isChunked && len(bodyInStart) > 0 {
+					if containsChunkedTerminator(nil, bodyInStart) {
+						logger.Debug().Msg("Chunked response complete (terminator in start frame)")
+						responseComplete = true
+					} else {
+						// Save tail for cross-frame terminator detection
+						tailLen := len(chunkedTerminator) - 1
+						if len(bodyInStart) >= tailLen {
+							prevFrameTail = bodyInStart[len(bodyInStart)-tailLen:]
+						} else {
+							prevFrameTail = bodyInStart
+						}
+					}
+				}
+
+				if responseComplete {
+					if cancelErr := ag.SendHTTPRequestCancel(requestID); cancelErr != nil {
+						logger.Debug().Err(cancelErr).Msg("Failed to send cancel frame to agent")
+					}
+					h.metricsTracker.IncrementWebsocketMessage("sent", "request_cancel")
+					return statusCode
+				}
 
 			case protocol.FrameTypeData:
 				if !headersSent {
 					logger.Warn().Msg("Received data frame before start frame")
 					continue
 				}
+
+				// Track body bytes received
+				bodyBytesReceived += int64(len(payload))
 
 				// Write chunk directly to TCP connection
 				if _, err := conn.Write(payload); err != nil {
@@ -441,6 +520,43 @@ func (h *HTTPHandler) streamResponseToTCP(
 				logger.Debug().Int("chunkBytes", len(payload)).Msg("Sent chunk")
 				h.metricsTracker.IncrementWebsocketMessage("recv", "response_data")
 
+				// Check if response is complete
+				responseComplete := false
+
+				// Content-Length: check if we've received all bytes
+				if contentLength >= 0 && bodyBytesReceived >= contentLength {
+					logger.Debug().Int64("contentLength", contentLength).Int64("received", bodyBytesReceived).Msg("Content-Length response complete")
+					responseComplete = true
+				}
+
+				// Chunked: check for terminator
+				if !responseComplete && isChunked {
+					if containsChunkedTerminator(prevFrameTail, payload) {
+						logger.Debug().Msg("Chunked response complete")
+						responseComplete = true
+					} else {
+						// Save tail for cross-frame terminator detection
+						tailLen := len(chunkedTerminator) - 1
+						if len(payload) >= tailLen {
+							prevFrameTail = payload[len(payload)-tailLen:]
+						} else {
+							// Payload smaller than tail length, combine with previous
+							prevFrameTail = append(prevFrameTail, payload...)
+							if len(prevFrameTail) > tailLen {
+								prevFrameTail = prevFrameTail[len(prevFrameTail)-tailLen:]
+							}
+						}
+					}
+				}
+
+				if responseComplete {
+					if cancelErr := ag.SendHTTPRequestCancel(requestID); cancelErr != nil {
+						logger.Debug().Err(cancelErr).Msg("Failed to send cancel frame to agent")
+					}
+					h.metricsTracker.IncrementWebsocketMessage("sent", "request_cancel")
+					return statusCode
+				}
+
 			case protocol.FrameTypeEnd:
 				errorMsg := string(payload)
 				if errorMsg != "" {
@@ -450,16 +566,12 @@ func (h *HTTPHandler) streamResponseToTCP(
 						return http.StatusBadGateway
 					}
 				}
-				logger.Debug().Int("statusCode", statusCode).Msg("Request completed")
+				// END frame means backend closed connection - no need to send CANCEL
+				// since the agent already knows the connection is done.
+				// This is the fallback path for Connection: close or responses
+				// where we couldn't detect body completion.
+				logger.Debug().Int("statusCode", statusCode).Msg("Request completed (backend closed)")
 				h.metricsTracker.IncrementWebsocketMessage("recv", "response_end")
-				// Wait for client to close connection, then send CANCEL to agent
-				// so it can clean up the backend connection immediately.
-				<-clientClosed
-				logger.Debug().Msg("Client closed connection after response")
-				if cancelErr := ag.SendHTTPRequestCancel(requestID); cancelErr != nil {
-					logger.Debug().Err(cancelErr).Msg("Failed to send cancel frame to agent")
-				}
-				h.metricsTracker.IncrementWebsocketMessage("sent", "request_cancel")
 				return statusCode
 			}
 
