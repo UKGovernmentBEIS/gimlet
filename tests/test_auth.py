@@ -409,30 +409,42 @@ def test_agent_duplicate_connection_rejected():
     """Test that duplicate agent connection to same control server is rejected."""
     import json
 
-    # Use an existing agent's JWT (agent-v1-1 is already connected to both control servers)
+    # Use an existing agent's JWT
     jwt_path = Path(__file__).parent / "resources" / "credentials" / "agent-v1-1.jwt"
     agent_jwt = jwt_path.read_text().strip()
 
-    # Try to connect with same agent ID - should be rejected since agent-v1-1 is already connected
-    ws = websocket.create_connection(
-        CONTROL_WS_URL,
-        host="control.local",
-        header=[f"Authorization: Bearer {agent_jwt}"],
-        timeout=5,
-    )
+    # With 2 servers behind a load balancer, we need to create enough connections
+    # to guarantee at least one hits a server that already has this agent connected.
+    # By pigeonhole principle: 3 connections to 2 servers = at least one duplicate.
+    connections = []
+    responses = []
 
-    # WebSocket upgrade succeeds (JWT is valid), but server should send error and close
-    msg = ws.recv()
-    data = json.loads(msg)
+    for i in range(3):
+        ws = websocket.create_connection(
+            CONTROL_WS_URL,
+            host="control.local",
+            header=[f"Authorization: Bearer {agent_jwt}"],
+            timeout=5,
+        )
+        msg = ws.recv()
+        data = json.loads(msg)
+        connections.append(ws)
+        responses.append(data)
 
-    # Should receive error message about duplicate connection
-    assert "error" in data, f"Expected error message, got: {data}"
-    assert (
-        "create multiple connections to a server with the same jwt"
-        in data["error"].lower()
-    ), f"Wrong error message: {data['error']}"
+    # Clean up connections
+    for ws in connections:
+        ws.close()
 
-    ws.close()
+    # At least one response should be a duplicate rejection error
+    duplicate_errors = [r for r in responses if "error" in r]
+    assert len(duplicate_errors) >= 1, f"Expected at least one duplicate rejection, got responses: {responses}"
+
+    # Verify the error message is correct
+    for error_response in duplicate_errors:
+        assert (
+            "create multiple connections to a server with the same jwt"
+            in error_response["error"].lower()
+        ), f"Wrong error message: {error_response['error']}"
 
 
 if __name__ == "__main__":

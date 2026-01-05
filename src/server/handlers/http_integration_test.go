@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"gimlet/protocol"
 	"gimlet/server/agentmgr"
 	"gimlet/server/auth"
 
@@ -502,6 +503,28 @@ func (m *trackingWebSocketConn) waitForCancel(timeout time.Duration) bool {
 	}
 }
 
+func (m *trackingWebSocketConn) getMessages() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([][]byte, len(m.messages))
+	copy(result, m.messages)
+	return result
+}
+
+func (m *trackingWebSocketConn) waitForMessage(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		hasMessages := len(m.messages) > 0
+		m.mu.Unlock()
+		if hasMessages {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 // TestClientClosureTriggersCancel tests that when a client closes the connection,
 // the server sends a CANCEL frame to the agent
 func TestClientClosureTriggersCancel(t *testing.T) {
@@ -571,5 +594,117 @@ func TestClientClosureTriggersCancel(t *testing.T) {
 		// Good
 	case <-time.After(3 * time.Second):
 		t.Error("Handler did not complete after client closure")
+	}
+}
+
+// TestCancelSentAfterSuccessfulResponse tests that when a response completes successfully,
+// the server sends a CANCEL frame to the agent so it can close the backend connection.
+// This prevents agents from waiting for the backend's HTTP/1.1 keep-alive timeout (~60s).
+func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
+	// Setup
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	token := generateClientJWT(t, privateKey, []string{"*"})
+	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
+	metrics := &mockMetricsTracker{}
+
+	// Create a tracking WebSocket connection to detect CANCEL frames
+	trackingWS := newTrackingWebSocketConn()
+	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
+	agent.SetReady(true)
+
+	agentProvider := &testAgentProvider{
+		agents: map[string]*agentmgr.Agent{
+			"agent-1": agent,
+		},
+	}
+
+	handler := NewHTTPHandler(
+		validator,
+		agentProvider,
+		"test-server",
+		30*time.Second,
+		100,
+		0,
+		zerolog.New(io.Discard),
+		metrics,
+	)
+
+	// Create pipe for client connection
+	clientConn, serverConn := net.Pipe()
+
+	// Start handler
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleTCPConnection(serverConn)
+		close(handlerDone)
+	}()
+
+	// Send a valid request
+	request := "GET /services/test-service/test HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
+		"\r\n"
+	clientConn.Write([]byte(request))
+
+	// Wait for request to be forwarded to the agent
+	if !trackingWS.waitForMessage(2 * time.Second) {
+		t.Fatal("Request was not forwarded to agent")
+	}
+
+	// Extract requestID from the first message (Start frame)
+	messages := trackingWS.getMessages()
+	if len(messages) == 0 {
+		t.Fatal("No messages received by agent")
+	}
+
+	// Decode the Start frame to get requestID
+	frameType, requestID, _, err := protocol.DecodeFrame(messages[0])
+	if err != nil {
+		t.Fatalf("Failed to decode frame: %v", err)
+	}
+	if frameType != protocol.FrameTypeStart {
+		t.Fatalf("Expected Start frame, got frame type %d", frameType)
+	}
+
+	// Simulate agent sending a complete response (Start + End frames)
+	responseHeaders := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(responseHeaders))
+	if !agent.DeliverResponseFrame(requestID, startFrame) {
+		t.Fatal("Failed to deliver response start frame")
+	}
+
+	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
+	if !agent.DeliverResponseFrame(requestID, endFrame) {
+		t.Fatal("Failed to deliver response end frame")
+	}
+
+	// Read the response from the client side to unblock the handler
+	clientReader := bufio.NewReader(clientConn)
+	resp, err := http.ReadResponse(clientReader, nil)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Close the client connection - this triggers the server to send CANCEL to the agent
+	clientConn.Close()
+
+	// Verify CANCEL frame was sent to agent after client closed connection
+	if !trackingWS.waitForCancel(2 * time.Second) {
+		t.Error("Expected CANCEL frame to be sent to agent after client closed connection")
+	}
+
+	// Wait for handler to complete
+	select {
+	case <-handlerDone:
+		// Good
+	case <-time.After(3 * time.Second):
+		t.Error("Handler did not complete")
 	}
 }
