@@ -597,11 +597,9 @@ func TestClientClosureTriggersCancel(t *testing.T) {
 	}
 }
 
-// TestCancelSentAfterSuccessfulResponse tests that when a response completes successfully,
-// the server sends a CANCEL frame to the agent so it can close the backend connection.
-// This prevents agents from waiting for the backend's HTTP/1.1 keep-alive timeout (~60s).
-func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
-	// Setup
+// TestCancelSentOnContentLengthComplete tests that CANCEL is sent immediately
+// when a Content-Length response body is fully received.
+func TestCancelSentOnContentLengthComplete(t *testing.T) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("Failed to generate key: %v", err)
@@ -611,100 +609,303 @@ func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
 	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
 	metrics := &mockMetricsTracker{}
 
-	// Create a tracking WebSocket connection to detect CANCEL frames
 	trackingWS := newTrackingWebSocketConn()
 	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
 	agent.SetReady(true)
 
 	agentProvider := &testAgentProvider{
-		agents: map[string]*agentmgr.Agent{
-			"agent-1": agent,
-		},
+		agents: map[string]*agentmgr.Agent{"agent-1": agent},
 	}
 
 	handler := NewHTTPHandler(
-		validator,
-		agentProvider,
-		"test-server",
-		30*time.Second,
-		100,
-		0,
-		zerolog.New(io.Discard),
-		metrics,
+		validator, agentProvider, "test-server",
+		30*time.Second, 100, 0,
+		zerolog.New(io.Discard), metrics,
 	)
 
-	// Create pipe for client connection
 	clientConn, serverConn := net.Pipe()
 
-	// Start handler
+	// Read from client side to prevent handler from blocking on writes
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	handlerDone := make(chan struct{})
 	go func() {
 		handler.HandleTCPConnection(serverConn)
 		close(handlerDone)
 	}()
 
-	// Send a valid request
+	// Send request
 	request := "GET /services/test-service/test HTTP/1.1\r\n" +
 		"Host: localhost\r\n" +
 		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
 		"\r\n"
 	clientConn.Write([]byte(request))
 
-	// Wait for request to be forwarded to the agent
 	if !trackingWS.waitForMessage(2 * time.Second) {
 		t.Fatal("Request was not forwarded to agent")
 	}
 
-	// Extract requestID from the first message (Start frame)
 	messages := trackingWS.getMessages()
-	if len(messages) == 0 {
-		t.Fatal("No messages received by agent")
-	}
+	_, requestID, _, _ := protocol.DecodeFrame(messages[0])
 
-	// Decode the Start frame to get requestID
-	frameType, requestID, _, err := protocol.DecodeFrame(messages[0])
-	if err != nil {
-		t.Fatalf("Failed to decode frame: %v", err)
-	}
-	if frameType != protocol.FrameTypeStart {
-		t.Fatalf("Expected Start frame, got frame type %d", frameType)
-	}
-
-	// Simulate agent sending a complete response (Start + End frames)
+	// Send response with Content-Length: 5 and body "hello" - all in start frame
 	responseHeaders := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
 	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(responseHeaders))
-	if !agent.DeliverResponseFrame(requestID, startFrame) {
-		t.Fatal("Failed to deliver response start frame")
-	}
+	agent.DeliverResponseFrame(requestID, startFrame)
 
-	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
-	if !agent.DeliverResponseFrame(requestID, endFrame) {
-		t.Fatal("Failed to deliver response end frame")
-	}
-
-	// Read the response from the client side to unblock the handler
-	clientReader := bufio.NewReader(clientConn)
-	resp, err := http.ReadResponse(clientReader, nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-	if resp.StatusCode != 200 {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode)
-	}
-
-	// Close the client connection - this triggers the server to send CANCEL to the agent
-	clientConn.Close()
-
-	// Verify CANCEL frame was sent to agent after client closed connection
+	// CANCEL should be sent immediately when Content-Length body is complete
+	// (no need to wait for client close or END frame)
 	if !trackingWS.waitForCancel(2 * time.Second) {
-		t.Error("Expected CANCEL frame to be sent to agent after client closed connection")
+		t.Error("Expected CANCEL frame when Content-Length response body complete")
 	}
 
-	// Wait for handler to complete
-	select {
-	case <-handlerDone:
-		// Good
-	case <-time.After(3 * time.Second):
-		t.Error("Handler did not complete")
+	// Clean up
+	clientConn.Close()
+	<-handlerDone
+}
+
+// TestCancelSentOnNoBodyResponse tests that CANCEL is sent immediately
+// for responses that have no body (204, 304).
+func TestCancelSentOnNoBodyResponse(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
 	}
+
+	token := generateClientJWT(t, privateKey, []string{"*"})
+	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
+	metrics := &mockMetricsTracker{}
+
+	trackingWS := newTrackingWebSocketConn()
+	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
+	agent.SetReady(true)
+
+	agentProvider := &testAgentProvider{
+		agents: map[string]*agentmgr.Agent{"agent-1": agent},
+	}
+
+	handler := NewHTTPHandler(
+		validator, agentProvider, "test-server",
+		30*time.Second, 100, 0,
+		zerolog.New(io.Discard), metrics,
+	)
+
+	clientConn, serverConn := net.Pipe()
+
+	// Read from client side to prevent handler from blocking on writes
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleTCPConnection(serverConn)
+		close(handlerDone)
+	}()
+
+	request := "GET /services/test-service/test HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
+		"\r\n"
+	clientConn.Write([]byte(request))
+
+	if !trackingWS.waitForMessage(2 * time.Second) {
+		t.Fatal("Request was not forwarded to agent")
+	}
+
+	messages := trackingWS.getMessages()
+	_, requestID, _, _ := protocol.DecodeFrame(messages[0])
+
+	// Send 204 No Content response - no body expected
+	response204 := "HTTP/1.1 204 No Content\r\n\r\n"
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(response204))
+	agent.DeliverResponseFrame(requestID, startFrame)
+
+	// CANCEL should be sent immediately for no-body responses
+	if !trackingWS.waitForCancel(2 * time.Second) {
+		t.Error("Expected CANCEL frame immediately for 204 No Content response")
+	}
+
+	clientConn.Close()
+	<-handlerDone
+}
+
+// TestCancelSentOnChunkedComplete tests that CANCEL is sent when
+// chunked encoding terminator is detected.
+func TestCancelSentOnChunkedComplete(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	token := generateClientJWT(t, privateKey, []string{"*"})
+	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
+	metrics := &mockMetricsTracker{}
+
+	trackingWS := newTrackingWebSocketConn()
+	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
+	agent.SetReady(true)
+
+	agentProvider := &testAgentProvider{
+		agents: map[string]*agentmgr.Agent{"agent-1": agent},
+	}
+
+	handler := NewHTTPHandler(
+		validator, agentProvider, "test-server",
+		30*time.Second, 100, 0,
+		zerolog.New(io.Discard), metrics,
+	)
+
+	clientConn, serverConn := net.Pipe()
+
+	// Read from client side to prevent handler from blocking on writes
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleTCPConnection(serverConn)
+		close(handlerDone)
+	}()
+
+	request := "GET /services/test-service/test HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
+		"\r\n"
+	clientConn.Write([]byte(request))
+
+	if !trackingWS.waitForMessage(2 * time.Second) {
+		t.Fatal("Request was not forwarded to agent")
+	}
+
+	messages := trackingWS.getMessages()
+	_, requestID, _, _ := protocol.DecodeFrame(messages[0])
+
+	// Send chunked response headers
+	responseHeaders := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(responseHeaders))
+	agent.DeliverResponseFrame(requestID, startFrame)
+
+	// Send a chunk followed by the terminator
+	// Format: chunk-size\r\n chunk-data\r\n ... 0\r\n\r\n
+	chunkData := "5\r\nhello\r\n0\r\n\r\n"
+	dataFrame := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte(chunkData))
+	agent.DeliverResponseFrame(requestID, dataFrame)
+
+	// CANCEL should be sent when chunked terminator is detected
+	if !trackingWS.waitForCancel(2 * time.Second) {
+		t.Error("Expected CANCEL frame when chunked terminator detected")
+	}
+
+	clientConn.Close()
+	<-handlerDone
+}
+
+// TestCancelSentOnChunkedTerminatorSplitAcrossFrames tests that CANCEL is sent
+// when the chunked terminator spans two frames.
+func TestCancelSentOnChunkedTerminatorSplitAcrossFrames(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	token := generateClientJWT(t, privateKey, []string{"*"})
+	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
+	metrics := &mockMetricsTracker{}
+
+	trackingWS := newTrackingWebSocketConn()
+	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
+	agent.SetReady(true)
+
+	agentProvider := &testAgentProvider{
+		agents: map[string]*agentmgr.Agent{"agent-1": agent},
+	}
+
+	handler := NewHTTPHandler(
+		validator, agentProvider, "test-server",
+		30*time.Second, 100, 0,
+		zerolog.New(io.Discard), metrics,
+	)
+
+	clientConn, serverConn := net.Pipe()
+
+	// Read from client side to prevent handler from blocking on writes
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.HandleTCPConnection(serverConn)
+		close(handlerDone)
+	}()
+
+	request := "GET /services/test-service/test HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
+		"\r\n"
+	clientConn.Write([]byte(request))
+
+	if !trackingWS.waitForMessage(2 * time.Second) {
+		t.Fatal("Request was not forwarded to agent")
+	}
+
+	messages := trackingWS.getMessages()
+	_, requestID, _, _ := protocol.DecodeFrame(messages[0])
+
+	// Send chunked response headers
+	responseHeaders := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(responseHeaders))
+	agent.DeliverResponseFrame(requestID, startFrame)
+
+	// Send chunk data ending with partial terminator "0\r\n"
+	chunkData1 := "5\r\nhello\r\n0\r\n"
+	dataFrame1 := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte(chunkData1))
+	agent.DeliverResponseFrame(requestID, dataFrame1)
+
+	// CANCEL should NOT be sent yet (terminator incomplete)
+	time.Sleep(100 * time.Millisecond)
+	if trackingWS.waitForCancel(100 * time.Millisecond) {
+		t.Error("CANCEL should not be sent before terminator is complete")
+	}
+
+	// Send the rest of the terminator "\r\n"
+	chunkData2 := "\r\n"
+	dataFrame2 := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte(chunkData2))
+	agent.DeliverResponseFrame(requestID, dataFrame2)
+
+	// Now CANCEL should be sent
+	if !trackingWS.waitForCancel(2 * time.Second) {
+		t.Error("Expected CANCEL frame when split chunked terminator completed")
+	}
+
+	clientConn.Close()
+	<-handlerDone
 }
