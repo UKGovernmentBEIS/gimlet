@@ -423,10 +423,22 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 		}
 	}()
 
+	// Helper to wait for request goroutine with timeout
+	waitForRequestGoroutine := func() {
+		select {
+		case <-requestDone:
+		case <-h.done:
+			reqLogger.Debug().Msg("Connection closing, abandoning request wait")
+		case <-time.After(5 * time.Second):
+			reqLogger.Warn().Msg("Timeout waiting for request goroutine to complete")
+		}
+	}
+
 	// Parse HTTP response from backend
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		close(responseDone)
+		waitForRequestGoroutine()
 		reqLogger.Error().Err(err).Msg("Failed to parse HTTP response from backend")
 		h.metrics.incrementBackendFailures()
 		h.sendErrorResponse(requestID, 502, "Bad Gateway")
@@ -439,6 +451,7 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, headers)
 	if err := h.writeFrame(startFrame); err != nil {
 		close(responseDone)
+		waitForRequestGoroutine()
 		reqLogger.Error().Err(err).Msg("Failed to send response headers")
 		return
 	}
