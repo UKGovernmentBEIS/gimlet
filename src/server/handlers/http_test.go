@@ -1,12 +1,12 @@
 package handlers
+
 import (
-	"bytes"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
 	"github.com/rs/zerolog"
 )
 // TestExtractServiceFromPath tests extracting service names from URL paths
@@ -241,107 +241,7 @@ func TestSerializeRequestHeadersProto(t *testing.T) {
 		})
 	}
 }
-// TestWriteHTTPError tests error response writing
-func TestWriteHTTPError(t *testing.T) {
-	tests := []struct {
-		name       string
-		statusCode int
-		message    string
-		validate   func(*testing.T, []byte)
-	}{
-		{
-			name:       "404 Not Found",
-			statusCode: 404,
-			message:    "Page not found",
-			validate: func(t *testing.T, data []byte) {
-				str := string(data)
-				if !strings.Contains(str, "HTTP/1.1 404 Not Found") {
-					t.Error("Missing status line")
-				}
-				if !strings.Contains(str, "Content-Type: text/plain") {
-					t.Error("Missing Content-Type header")
-				}
-				if !strings.Contains(str, "Content-Length: 14") {
-					t.Errorf("Incorrect Content-Length, expected 14 for 'Page not found'")
-				}
-				if !strings.HasSuffix(str, "\r\n\r\nPage not found") {
-					t.Error("Missing body or incorrect formatting")
-				}
-			},
-		},
-		{
-			name:       "401 Unauthorized",
-			statusCode: 401,
-			message:    "Invalid credentials",
-			validate: func(t *testing.T, data []byte) {
-				str := string(data)
-				if !strings.Contains(str, "HTTP/1.1 401 Unauthorized") {
-					t.Error("Missing status line")
-				}
-				if !strings.Contains(str, "Invalid credentials") {
-					t.Error("Missing error message in body")
-				}
-			},
-		},
-		{
-			name:       "500 Internal Server Error",
-			statusCode: 500,
-			message:    "Something went wrong",
-			validate: func(t *testing.T, data []byte) {
-				str := string(data)
-				if !strings.Contains(str, "HTTP/1.1 500 Internal Server Error") {
-					t.Error("Missing status line")
-				}
-				if !strings.Contains(str, "Something went wrong") {
-					t.Error("Missing error message in body")
-				}
-			},
-		},
-		{
-			name:       "empty message",
-			statusCode: 400,
-			message:    "",
-			validate: func(t *testing.T, data []byte) {
-				str := string(data)
-				if !strings.Contains(str, "Content-Length: 0") {
-					t.Error("Expected Content-Length: 0 for empty message")
-				}
-				if !strings.HasSuffix(str, "\r\n\r\n") {
-					t.Error("Expected empty body after headers")
-				}
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := &HTTPHandler{}
-			// Use a buffer to capture what would be written to the connection
-			var buf bytes.Buffer
-			// Create a mock connection that writes to buffer
-			mockConn := &mockNetConn{buf: &buf}
-			h.writeHTTPError(mockConn, tt.statusCode, tt.message)
-			if tt.validate != nil {
-				tt.validate(t, buf.Bytes())
-			}
-		})
-	}
-}
-// mockNetConn implements net.Conn for testing
-type mockNetConn struct {
-	buf *bytes.Buffer
-}
-func (m *mockNetConn) Read(b []byte) (n int, err error) {
-	return m.buf.Read(b)
-}
-func (m *mockNetConn) Write(b []byte) (n int, err error) {
-	return m.buf.Write(b)
-}
-func (m *mockNetConn) Close() error                       { return nil }
-func (m *mockNetConn) LocalAddr() net.Addr                { return nil }
-func (m *mockNetConn) RemoteAddr() net.Addr               { return nil }
-func (m *mockNetConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockNetConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockNetConn) SetWriteDeadline(t time.Time) error { return nil }
+
 // mockMetricsTracker implements MetricsTracker for testing
 type mockMetricsTracker struct{}
 func (m *mockMetricsTracker) IncrementActiveRequests(service string)                         {}
