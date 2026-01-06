@@ -321,29 +321,39 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	// Stop accepting new connections and wait for handlers to complete
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error().Err(err).Msg("HTTP server shutdown error")
-	}
-
-	// Wait for in-flight /services/* requests to complete (with timeout)
-	// Note: httpServer.Shutdown waits for handlers, but our activeRequests.Add/Done
-	// wrapper ensures we track even after the handler returns but before cleanup
-	logger.Info().Msg("Waiting for in-flight requests to complete...")
-	requestsDone := make(chan struct{})
+	// Stop accepting new connections (httpServer.Shutdown stops listener immediately)
+	// Run shutdown in background - it waits for all handlers to return
+	shutdownDone := make(chan struct{})
 	go func() {
-		cs.activeRequests.Wait()
-		close(requestsDone)
+		// Use background context - Shutdown will wait indefinitely for handlers
+		if err := httpServer.Shutdown(context.Background()); err != nil {
+			logger.Error().Err(err).Msg("HTTP server shutdown error")
+		}
+		close(shutdownDone)
 	}()
 
+	// Wait for httpServer.Shutdown to complete (all handlers returned)
+	// Use timeout only for logging progress, not for forcing shutdown
+	logger.Info().Msg("Waiting for in-flight requests to complete...")
 	select {
-	case <-requestsDone:
-		logger.Info().Msg("All in-flight requests completed")
+	case <-shutdownDone:
+		logger.Info().Msg("All HTTP handlers completed")
 	case <-shutdownCtx.Done():
-		logger.Warn().Msg("Timeout waiting for in-flight requests, forcing shutdown")
+		// Timeout reached, but handlers are still running
+		// Close agent connections to unblock any handlers waiting on responses
+		logger.Warn().Msg("Shutdown timeout - closing agent connections to unblock handlers")
+		cs.agentsLock.Lock()
+		for _, ag := range cs.agents {
+			ag.Conn.Close()
+		}
+		cs.agentsLock.Unlock()
+
+		// Now wait for handlers to actually finish
+		<-shutdownDone
+		logger.Info().Msg("All HTTP handlers completed after agent disconnect")
 	}
 
-	// Close all agent connections
+	// Clean up any remaining agent connections
 	cs.agentsLock.Lock()
 	for _, ag := range cs.agents {
 		ag.Conn.Close()
