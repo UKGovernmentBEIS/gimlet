@@ -15,7 +15,6 @@ HTTP tunnel exposing services on egress-only networks. See README.md for usage, 
 - Fail fast and loud - errors should propagate, not be swallowed
 - Be explicit with types
 - Use structured logging with context (requestID, agentID, service)
-- Keep the "dumb pipe" simple - no HTTP parsing in agent
 
 **Don't:**
 - Add defensive nil checks that hide bugs (if `a.b` should exist, let it crash with a clear error rather than silently setting `c = nil`)
@@ -32,7 +31,7 @@ HTTP tunnel exposing services on egress-only networks. See README.md for usage, 
 
 ## Architecture Quick Reference
 
-**Binary frame protocol:** 4 frame types (`start`, `data`, `end`, `cancel`) with requestID prefix. Agent is a dumb pipe - no HTTP parsing, just byte forwarding.
+**Binary frame protocol:** 4 frame types (`start`, `data`, `end`, `cancel`) with requestID prefix. START frames contain HTTP headers only; body is streamed in DATA frames. Agent parses HTTP responses from backends using `http.ReadResponse()`.
 
 **Full-mesh topology:** Each agent connects to ALL servers via probe-based discovery (5s interval through load balancer). Server rejects duplicates.
 
@@ -45,7 +44,7 @@ HTTP tunnel exposing services on egress-only networks. See README.md for usage, 
 ```
 src/server/          # Go server
 ├── config/          # CLI flags, env vars, config struct
-├── handlers/        # HTTP/TCP handlers, service routing
+├── handlers/        # HTTP handlers, service routing
 ├── agentmgr/        # Agent connections, binary frames
 ├── auth/            # JWT validation
 └── main.go          # Orchestration
@@ -68,14 +67,13 @@ tests/
 
 ## Key Code Paths
 
-**Server request handling** (`src/server/handlers/http.go:HandleTCPConnection`):
-1. Read HTTP request from TCP
-2. Extract service from URL path (`/services/<service>/...`)
-3. Rewrite path (strip `/services/<service>` prefix)
-4. Validate client JWT
-5. Select agent via round-robin from ready agents for service
-6. Stream request as binary frames to agent
-7. Stream response frames back to client
+**Server request handling** (`src/server/handlers/http.go:ServeHTTP`):
+1. Extract service from URL path (`/services/<service>/...`)
+2. Rewrite path (strip `/services/<service>` prefix)
+3. Validate client JWT
+4. Select agent via round-robin from ready agents for service
+5. Stream request body as binary frames to agent
+6. Stream response frames back to client via `http.ResponseWriter`
 
 **Agent connection** (`src/agent/main.go:tryConnect`):
 1. Connect via WebSocket with JWT auth

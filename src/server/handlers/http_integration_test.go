@@ -1,13 +1,12 @@
 package handlers
 
 import (
-	"bufio"
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +49,7 @@ func generateClientJWT(t *testing.T, privateKey *rsa.PrivateKey, services []stri
 	return tokenString
 }
 
-func TestHandleTCPConnection_MissingAuth(t *testing.T) {
+func TestServeHTTP_MissingAuth(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -72,30 +71,19 @@ func TestHandleTCPConnection_MissingAuth(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	// Create request without auth header
+	req := httptest.NewRequest("GET", "/services/service-1/test", nil)
+	w := httptest.NewRecorder()
 
-	// Send request without auth header
-	go handler.HandleTCPConnection(serverConn)
+	handler.ServeHTTP(w, req)
 
-	request := "GET /services/service-1/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Read response
-	resp, err := http.ReadResponse(bufio.NewReader(clientConn), nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
+	resp := w.Result()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("Expected status 401, got %d", resp.StatusCode)
 	}
 }
 
-func TestHandleTCPConnection_InvalidJWT(t *testing.T) {
+func TestServeHTTP_InvalidJWT(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -117,31 +105,20 @@ func TestHandleTCPConnection_InvalidJWT(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	// Create request with invalid token
+	req := httptest.NewRequest("GET", "/services/service-1/test", nil)
+	req.Header.Set("Authorization", "Bearer invalid-token")
+	w := httptest.NewRecorder()
 
-	// Send request with invalid token
-	go handler.HandleTCPConnection(serverConn)
+	handler.ServeHTTP(w, req)
 
-	request := "GET /services/service-1/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		"Authorization: Bearer invalid-token\r\n" +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Read response
-	resp, err := http.ReadResponse(bufio.NewReader(clientConn), nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
+	resp := w.Result()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("Expected status 401, got %d", resp.StatusCode)
 	}
 }
 
-func TestHandleTCPConnection_NoAgentsAvailable(t *testing.T) {
+func TestServeHTTP_NoAgentsAvailable(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -164,31 +141,20 @@ func TestHandleTCPConnection_NoAgentsAvailable(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	// Create valid request but no agents
+	req := httptest.NewRequest("GET", "/services/service-1/test", nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	w := httptest.NewRecorder()
 
-	// Send valid request but no agents
-	go handler.HandleTCPConnection(serverConn)
+	handler.ServeHTTP(w, req)
 
-	request := "GET /services/service-1/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Read response
-	resp, err := http.ReadResponse(bufio.NewReader(clientConn), nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
+	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("Expected status 503, got %d", resp.StatusCode)
 	}
 }
 
-func TestHandleTCPConnection_InvalidPath(t *testing.T) {
+func TestServeHTTP_InvalidPath(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -210,30 +176,19 @@ func TestHandleTCPConnection_InvalidPath(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	// Create request without /services/ prefix
+	req := httptest.NewRequest("GET", "/test", nil)
+	w := httptest.NewRecorder()
 
-	// Send request without /services/ prefix
-	go handler.HandleTCPConnection(serverConn)
+	handler.ServeHTTP(w, req)
 
-	request := "GET /test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Read response
-	resp, err := http.ReadResponse(bufio.NewReader(clientConn), nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
+	resp := w.Result()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("Expected status 400, got %d", resp.StatusCode)
 	}
 }
 
-func TestHandleTCPConnection_UnauthorizedService(t *testing.T) {
+func TestServeHTTP_UnauthorizedService(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -257,31 +212,20 @@ func TestHandleTCPConnection_UnauthorizedService(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	// Create request for service-2 (not authorized)
+	req := httptest.NewRequest("GET", "/services/service-2/test", nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	w := httptest.NewRecorder()
 
-	// Send request for service-2 (not authorized)
-	go handler.HandleTCPConnection(serverConn)
+	handler.ServeHTTP(w, req)
 
-	request := "GET /services/service-2/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Read response
-	resp, err := http.ReadResponse(bufio.NewReader(clientConn), nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
+	resp := w.Result()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("Expected status 403, got %d", resp.StatusCode)
 	}
 }
 
-func TestHandleTCPConnection_LoadBalancing(t *testing.T) {
+func TestServeHTTP_LoadBalancing(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -322,27 +266,17 @@ func TestHandleTCPConnection_LoadBalancing(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-
-	// Send request - should select agent-2 (lower load)
-	// Note: We don't check internal state due to race conditions in tests
-	// The load balancing logic is tested implicitly - if it's broken, E2E tests will catch it
-	go handler.HandleTCPConnection(serverConn)
-
-	request := "GET /services/test-service/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
-		"\r\n"
-	clientConn.Write([]byte(request))
+	// Create valid request
+	req := httptest.NewRequest("GET", "/services/test-service/test", nil)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	w := httptest.NewRecorder()
 
 	// The test verifies that load balancing logic compiles and runs
 	// Detailed load distribution testing is done in E2E tests
-	time.Sleep(10 * time.Millisecond)
+	handler.ServeHTTP(w, req)
 
-	// Note: We don't cleanup dummy requests to avoid race with HandleTCPConnection
-	// which may still be reading agent.StreamCh. Test agents are garbage collected.
+	// Note: We don't check response status here since it depends on agent response
+	// which we haven't mocked. The test just ensures no panic/crash.
 }
 
 // Mock WebSocket connection for tests
@@ -387,50 +321,6 @@ func (m *mockWebSocketConn) SetWriteDeadline(t time.Time) error {
 
 func (m *mockWebSocketConn) SetReadDeadline(t time.Time) error {
 	return nil
-}
-
-func TestHandleTCPConnection_MalformedRequest(t *testing.T) {
-	// Setup
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("Failed to generate key: %v", err)
-	}
-
-	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
-	agentProvider := &testAgentProvider{agents: make(map[string]*agentmgr.Agent)}
-	metrics := &mockMetricsTracker{}
-
-	handler := NewHTTPHandler(
-		validator,
-		agentProvider,
-		"test-server",
-		10*time.Second,
-		100,
-		0,
-		zerolog.New(io.Discard),
-		metrics,
-	)
-
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-
-	// Send malformed request
-	go handler.HandleTCPConnection(serverConn)
-
-	malformed := "this is not http\r\n\r\n"
-	clientConn.Write([]byte(malformed))
-
-	// Read response
-	reader := bufio.NewReader(clientConn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-
-	if !strings.Contains(line, "400") {
-		t.Errorf("Expected 400 Bad Request, got: %s", line)
-	}
 }
 
 // trackingWebSocketConn tracks messages sent to the agent for verification
@@ -525,9 +415,9 @@ func (m *trackingWebSocketConn) waitForMessage(timeout time.Duration) bool {
 	return false
 }
 
-// TestClientClosureTriggersCancel tests that when a client closes the connection,
-// the server sends a CANCEL frame to the agent
-func TestClientClosureTriggersCancel(t *testing.T) {
+// TestServeHTTP_AgentResponseStreaming tests that responses from agents are properly
+// streamed to the client through the ServeHTTP handler
+func TestServeHTTP_AgentResponseStreaming(t *testing.T) {
 	// Setup
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -538,80 +428,7 @@ func TestClientClosureTriggersCancel(t *testing.T) {
 	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
 	metrics := &mockMetricsTracker{}
 
-	// Create a tracking WebSocket connection to detect CANCEL frames
-	trackingWS := newTrackingWebSocketConn()
-	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
-	agent.SetReady(true) // Agent must be ready to be selected
-
-	agentProvider := &testAgentProvider{
-		agents: map[string]*agentmgr.Agent{
-			"agent-1": agent,
-		},
-	}
-
-	handler := NewHTTPHandler(
-		validator,
-		agentProvider,
-		"test-server",
-		30*time.Second, // Long idle timeout - we want to test client closure, not timeout
-		100,
-		0,
-		zerolog.New(io.Discard),
-		metrics,
-	)
-
-	// Create pipe
-	clientConn, serverConn := net.Pipe()
-
-	// Start handler
-	handlerDone := make(chan struct{})
-	go func() {
-		handler.HandleTCPConnection(serverConn)
-		close(handlerDone)
-	}()
-
-	// Send a valid request
-	request := "GET /services/test-service/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Wait a bit for the request to be forwarded to the agent
-	time.Sleep(50 * time.Millisecond)
-
-	// Close the client connection (simulating curl finishing or client disconnect)
-	clientConn.Close()
-
-	// Verify CANCEL frame was sent to agent
-	if !trackingWS.waitForCancel(2 * time.Second) {
-		t.Error("Expected CANCEL frame to be sent to agent when client closed connection")
-	}
-
-	// Wait for handler to complete
-	select {
-	case <-handlerDone:
-		// Good
-	case <-time.After(3 * time.Second):
-		t.Error("Handler did not complete after client closure")
-	}
-}
-
-// TestCancelSentAfterSuccessfulResponse tests that when a response completes successfully,
-// the server sends a CANCEL frame to the agent so it can close the backend connection.
-// This prevents agents from waiting for the backend's HTTP/1.1 keep-alive timeout (~60s).
-func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
-	// Setup
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("Failed to generate key: %v", err)
-	}
-
-	token := generateClientJWT(t, privateKey, []string{"*"})
-	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
-	metrics := &mockMetricsTracker{}
-
-	// Create a tracking WebSocket connection to detect CANCEL frames
+	// Create a tracking WebSocket connection
 	trackingWS := newTrackingWebSocketConn()
 	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
 	agent.SetReady(true)
@@ -633,24 +450,25 @@ func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
 		metrics,
 	)
 
-	// Create pipe for client connection
-	clientConn, serverConn := net.Pipe()
+	// Create a test server that uses our handler
+	ts := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer ts.Close()
 
-	// Start handler
-	handlerDone := make(chan struct{})
+	// Make request in background
+	responseCh := make(chan *http.Response, 1)
 	go func() {
-		handler.HandleTCPConnection(serverConn)
-		close(handlerDone)
+		req, _ := http.NewRequest("GET", ts.URL+"/services/test-service/test", nil)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Logf("Request error: %v", err)
+			return
+		}
+		responseCh <- resp
 	}()
 
-	// Send a valid request
-	request := "GET /services/test-service/test HTTP/1.1\r\n" +
-		"Host: localhost\r\n" +
-		fmt.Sprintf("Authorization: Bearer %s\r\n", token) +
-		"\r\n"
-	clientConn.Write([]byte(request))
-
-	// Wait for request to be forwarded to the agent
+	// Wait for request to be forwarded to agent
 	if !trackingWS.waitForMessage(2 * time.Second) {
 		t.Fatal("Request was not forwarded to agent")
 	}
@@ -670,41 +488,119 @@ func TestCancelSentAfterSuccessfulResponse(t *testing.T) {
 		t.Fatalf("Expected Start frame, got frame type %d", frameType)
 	}
 
-	// Simulate agent sending a complete response (Start + End frames)
-	responseHeaders := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+	// Simulate agent sending a response with headers-only START (new protocol)
+	responseHeaders := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
 	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(responseHeaders))
 	if !agent.DeliverResponseFrame(requestID, startFrame) {
 		t.Fatal("Failed to deliver response start frame")
 	}
 
+	// Send body in DATA frame (new protocol)
+	dataFrame := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte("hello"))
+	if !agent.DeliverResponseFrame(requestID, dataFrame) {
+		t.Fatal("Failed to deliver response data frame")
+	}
+
+	// Send END frame
 	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
 	if !agent.DeliverResponseFrame(requestID, endFrame) {
 		t.Fatal("Failed to deliver response end frame")
 	}
 
-	// Read the response from the client side to unblock the handler
-	clientReader := bufio.NewReader(clientConn)
-	resp, err := http.ReadResponse(clientReader, nil)
-	if err != nil {
-		t.Fatalf("Failed to read response: %v", err)
-	}
-	if resp.StatusCode != 200 {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode)
-	}
-
-	// Close the client connection - this triggers the server to send CANCEL to the agent
-	clientConn.Close()
-
-	// Verify CANCEL frame was sent to agent after client closed connection
-	if !trackingWS.waitForCancel(2 * time.Second) {
-		t.Error("Expected CANCEL frame to be sent to agent after client closed connection")
-	}
-
-	// Wait for handler to complete
+	// Wait for response
 	select {
-	case <-handlerDone:
-		// Good
-	case <-time.After(3 * time.Second):
-		t.Error("Handler did not complete")
+	case resp := <-responseCh:
+		if resp.StatusCode != 200 {
+			t.Errorf("Expected status 200, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != "hello" {
+			t.Errorf("Expected body 'hello', got '%s'", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for response")
+	}
+}
+
+// TestServeHTTP_CancelOnAgentDisconnect tests that when an agent disconnects
+// mid-request, the handler returns an appropriate error
+func TestServeHTTP_CancelOnAgentDisconnect(t *testing.T) {
+	// Setup
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	token := generateClientJWT(t, privateKey, []string{"*"})
+	validator := auth.NewJWTValidator([]*rsa.PublicKey{&privateKey.PublicKey}, "gimlet-test")
+	metrics := &mockMetricsTracker{}
+
+	trackingWS := newTrackingWebSocketConn()
+	agent := agentmgr.NewAgent("agent-1", "test-service", trackingWS)
+	agent.SetReady(true)
+
+	agentProvider := &testAgentProvider{
+		agents: map[string]*agentmgr.Agent{
+			"agent-1": agent,
+		},
+	}
+
+	handler := NewHTTPHandler(
+		validator,
+		agentProvider,
+		"test-server",
+		30*time.Second,
+		100,
+		0,
+		zerolog.New(io.Discard),
+		metrics,
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer ts.Close()
+
+	// Make request in background
+	responseCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest("GET", ts.URL+"/services/test-service/test", nil)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		responseCh <- resp
+	}()
+
+	// Wait for request to be forwarded
+	if !trackingWS.waitForMessage(2 * time.Second) {
+		t.Fatal("Request was not forwarded to agent")
+	}
+
+	// Extract requestID
+	messages := trackingWS.getMessages()
+	_, requestID, _, _ := protocol.DecodeFrame(messages[0])
+
+	// Simulate agent disconnect by closing the response channel
+	agent.CleanupRequest(requestID)
+
+	// Wait for response - should be 502 Bad Gateway
+	select {
+	case resp := <-responseCh:
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("Expected status 502, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !strings.Contains(string(body), "Agent disconnected") {
+			t.Errorf("Expected 'Agent disconnected' in body, got: %s", body)
+		}
+	case err := <-errCh:
+		t.Fatalf("Request failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for response")
 	}
 }

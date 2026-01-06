@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -250,8 +248,14 @@ func main() {
 	go metrics.UpdateLoop(m, cs, 500*time.Millisecond)
 	go cs.logStatsLoop(5 * time.Second)
 
-	// Setup HTTP server mux for non-service routes
+	// Setup HTTP server mux
 	mux := http.NewServeMux()
+	mux.Handle("/services/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Track for graceful shutdown
+		cs.activeRequests.Add(1)
+		defer cs.activeRequests.Done()
+		cs.httpHandler.ServeHTTP(w, r)
+	}))
 	mux.HandleFunc("/agent", cs.handleAgentWebSocket)
 
 	// Add health endpoint to main mux if no separate port configured
@@ -270,6 +274,7 @@ func main() {
 	})
 
 	httpServer := &http.Server{
+		Addr:    ":" + cfg.HTTPPort,
 		Handler: mux,
 	}
 
@@ -297,29 +302,12 @@ func main() {
 		}()
 	}
 
-	// Setup single TCP listener with path-based routing
-	tcpListener, err := net.Listen("tcp", ":"+cfg.HTTPPort)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to start TCP listener")
-	}
-	defer tcpListener.Close()
-
 	logger.Info().Str("port", cfg.HTTPPort).Msg("Server listening")
 
-	// Accept connections in background with path-based routing
+	// Start HTTP server in background
 	go func() {
-		for {
-			conn, err := tcpListener.Accept()
-			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-					cs.logger.Debug().Msg("TCP listener closed, exiting accept loop")
-					return
-				}
-				cs.logger.Debug().Err(err).Msg("TCP accept error")
-				continue
-			}
-
-			go cs.routeConnection(conn, httpServer)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal().Err(err).Msg("HTTP server error")
 		}
 	}()
 
@@ -333,30 +321,39 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	// Stop accepting new connections
-	tcpListener.Close()
-
-	// Stop HTTP server (handles /agent, /metrics, /health)
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error().Err(err).Msg("HTTP server shutdown error")
-	}
-
-	// Wait for in-flight /services/* requests to complete (with timeout)
-	logger.Info().Msg("Waiting for in-flight requests to complete...")
-	requestsDone := make(chan struct{})
+	// Stop accepting new connections (httpServer.Shutdown stops listener immediately)
+	// Run shutdown in background - it waits for all handlers to return
+	shutdownDone := make(chan struct{})
 	go func() {
-		cs.activeRequests.Wait()
-		close(requestsDone)
+		// Use background context - Shutdown will wait indefinitely for handlers
+		if err := httpServer.Shutdown(context.Background()); err != nil {
+			logger.Error().Err(err).Msg("HTTP server shutdown error")
+		}
+		close(shutdownDone)
 	}()
 
+	// Wait for httpServer.Shutdown to complete (all handlers returned)
+	// Use timeout only for logging progress, not for forcing shutdown
+	logger.Info().Msg("Waiting for in-flight requests to complete...")
 	select {
-	case <-requestsDone:
-		logger.Info().Msg("All in-flight requests completed")
+	case <-shutdownDone:
+		logger.Info().Msg("All HTTP handlers completed")
 	case <-shutdownCtx.Done():
-		logger.Warn().Msg("Timeout waiting for in-flight requests, forcing shutdown")
+		// Timeout reached, but handlers are still running
+		// Close agent connections to unblock any handlers waiting on responses
+		logger.Warn().Msg("Shutdown timeout - closing agent connections to unblock handlers")
+		cs.agentsLock.Lock()
+		for _, ag := range cs.agents {
+			ag.Conn.Close()
+		}
+		cs.agentsLock.Unlock()
+
+		// Now wait for handlers to actually finish
+		<-shutdownDone
+		logger.Info().Msg("All HTTP handlers completed after agent disconnect")
 	}
 
-	// Close all agent connections
+	// Clean up any remaining agent connections
 	cs.agentsLock.Lock()
 	for _, ag := range cs.agents {
 		ag.Conn.Close()
@@ -364,108 +361,6 @@ func main() {
 	cs.agentsLock.Unlock()
 
 	logger.Info().Msg("Graceful shutdown complete")
-}
-
-// routeConnection peeks at the HTTP request path and routes accordingly:
-// - /services/* -> raw TCP handling (dumb pipe to agent)
-// - everything else -> HTTP server (/agent, /metrics, /health)
-func (cs *Server) routeConnection(conn net.Conn, httpServer *http.Server) {
-	// Read until we have the full request line (METHOD /path HTTP/1.x\r\n)
-	buf := make([]byte, 0, 1024)
-	tmp := make([]byte, 256)
-
-	for {
-		n, err := conn.Read(tmp)
-		if err != nil {
-			cs.logger.Debug().Err(err).Msg("Failed to read from connection during routing")
-			conn.Close()
-			return
-		}
-		buf = append(buf, tmp[:n]...)
-
-		// Check if we have the complete request line
-		if idx := bytes.Index(buf, []byte("\r\n")); idx != -1 {
-			// Parse request line: "METHOD /path HTTP/1.x"
-			requestLine := string(buf[:idx])
-			parts := strings.SplitN(requestLine, " ", 3)
-			if len(parts) < 2 {
-				cs.logger.Debug().Str("line", requestLine).Msg("Invalid request line")
-				conn.Close()
-				return
-			}
-
-			path := parts[1]
-
-			// Create wrapped connection that replays buffered bytes
-			wrappedConn := &prefixConn{
-				Conn:   conn,
-				prefix: buf,
-			}
-
-			// Route based on path
-			if strings.HasPrefix(path, "/services/") {
-				// Raw TCP handling for service requests
-				// Track for graceful shutdown
-				cs.activeRequests.Add(1)
-				cs.httpHandler.HandleTCPConnection(wrappedConn)
-				cs.activeRequests.Done()
-			} else {
-				// HTTP server for /agent, /metrics, /health, /
-				httpServer.Serve(&singleConnListener{conn: wrappedConn})
-			}
-			return
-		}
-
-		// Prevent buffer from growing too large
-		if len(buf) > 8192 {
-			cs.logger.Debug().Msg("Request line too long")
-			conn.Close()
-			return
-		}
-	}
-}
-
-// prefixConn wraps a net.Conn and prepends buffered bytes to reads
-type prefixConn struct {
-	net.Conn
-	prefix []byte
-	offset int
-}
-
-func (c *prefixConn) Read(b []byte) (int, error) {
-	// First, return any remaining prefix bytes
-	if c.offset < len(c.prefix) {
-		n := copy(b, c.prefix[c.offset:])
-		c.offset += n
-		return n, nil
-	}
-	// Then read from underlying connection
-	return c.Conn.Read(b)
-}
-
-// singleConnListener wraps a single connection as a net.Listener for http.Server.Serve
-type singleConnListener struct {
-	conn   net.Conn
-	served bool
-	mu     sync.Mutex
-}
-
-func (l *singleConnListener) Accept() (net.Conn, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.served {
-		return nil, net.ErrClosed
-	}
-	l.served = true
-	return l.conn, nil
-}
-
-func (l *singleConnListener) Close() error {
-	return nil
-}
-
-func (l *singleConnListener) Addr() net.Addr {
-	return l.conn.LocalAddr()
 }
 
 func (cs *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {

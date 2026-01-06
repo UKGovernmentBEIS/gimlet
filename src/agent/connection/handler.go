@@ -1,9 +1,12 @@
 package connection
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -315,8 +318,7 @@ func (h *Handler) Run() {
 	}
 }
 
-// handleHTTPRequest streams raw bytes between WebSocket frames and backend TCP connection
-// This is a "dumb pipe" - no HTTP parsing, just byte streaming
+// handleHTTPRequest streams request frames to backend and parses HTTP responses
 func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 	defer func() {
 		h.handlerMu.Lock()
@@ -347,7 +349,7 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 		defer h.requestTracker.DecrementRequests()
 	}
 
-	// Open raw TCP connection to backend
+	// Open TCP connection to backend
 	conn, err := h.dialer.DialTimeout("tcp", h.backendAddr, 5*time.Second)
 	if err != nil {
 		reqLogger.Error().Err(err).Msg("Failed to connect to backend")
@@ -360,12 +362,9 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 	// Channels for coordination between goroutines
 	requestDone := make(chan error, 1)
 	responseDone := make(chan struct{})
-	requestReleased := make(chan struct{}) // Signaled when server releases the request (client done or disconnected)
+	requestReleased := make(chan struct{}) // Signaled when server releases the request
 
-	// Goroutine: Stream request frames → backend TCP (no parsing, just write payloads)
-	// IMPORTANT: This goroutine must stay alive after receiving FrameTypeEnd to handle
-	// potential close frames from server (e.g., when client disconnects or idle timeout
-	// fires while backend keeps connection open for HTTP/1.1 keep-alive)
+	// Goroutine: Stream request frames → backend TCP
 	go func() {
 		endReceived := false
 
@@ -391,10 +390,8 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 				switch frameType {
 				case protocol.FrameTypeStart, protocol.FrameTypeData:
 					if endReceived {
-						// Ignore data after END (shouldn't happen)
 						continue
 					}
-					// Write payload directly to TCP (raw bytes, no parsing)
 					if _, err := conn.Write(payload); err != nil {
 						requestDone <- err
 						return
@@ -408,13 +405,12 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 						requestDone <- nil
 					}
 					endReceived = true
-					// DON'T return - continue listening for CANCEL in case backend
-					// doesn't close the connection (HTTP/1.1 keep-alive)
+					// Continue listening for CANCEL
 
 				case protocol.FrameTypeCancel:
 					reqLogger.Debug().Msg("Released by server")
 					close(requestReleased)
-					conn.Close() // Close backend connection - unblocks response Read()
+					conn.Close() // Unblocks resp.Body.Read()
 					if !endReceived {
 						requestDone <- fmt.Errorf("released by server")
 					}
@@ -422,36 +418,58 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 				}
 
 			case <-responseDone:
-				// Response streaming finished, request goroutine can exit
 				return
 			}
 		}
 	}()
 
-	// Main goroutine: Stream backend TCP → response frames (no parsing, just read bytes)
-	buffer := make([]byte, 64*1024) // 64KB chunks
-	firstChunk := true
+	// Helper to wait for request goroutine with timeout
+	waitForRequestGoroutine := func() {
+		select {
+		case <-requestDone:
+		case <-h.done:
+			reqLogger.Debug().Msg("Connection closing, abandoning request wait")
+		case <-time.After(5 * time.Second):
+			reqLogger.Warn().Msg("Timeout waiting for request goroutine to complete")
+		}
+	}
+
+	// Parse HTTP response from backend
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		close(responseDone)
+		waitForRequestGoroutine()
+		reqLogger.Error().Err(err).Msg("Failed to parse HTTP response from backend")
+		h.metrics.incrementBackendFailures()
+		h.sendErrorResponse(requestID, 502, "Bad Gateway")
+		return
+	}
+	defer resp.Body.Close()
+
+	// Send headers as START frame (headers only, no body)
+	headers := serializeResponseHeaders(resp)
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, headers)
+	if err := h.writeFrame(startFrame); err != nil {
+		close(responseDone)
+		waitForRequestGoroutine()
+		reqLogger.Error().Err(err).Msg("Failed to send response headers")
+		return
+	}
+	reqLogger.Debug().Int("statusCode", resp.StatusCode).Msg("Sent response headers")
+
+	// Stream decoded body as DATA frames
+	buffer := make([]byte, 64*1024)
 	var responseErr error
 
 	for {
-		n, readErr := conn.Read(buffer)
+		n, readErr := resp.Body.Read(buffer)
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buffer[:n])
 
-			// First chunk from backend is FrameTypeStart (contains HTTP headers)
-			// Subsequent chunks are FrameTypeData (body bytes)
-			var frameType byte
-			if firstChunk {
-				frameType = protocol.FrameTypeStart
-				firstChunk = false
-			} else {
-				frameType = protocol.FrameTypeData
-			}
-
-			frame := protocol.EncodeFrame(frameType, requestID, chunk)
-			if err := h.writeFrame(frame); err != nil {
-				reqLogger.Error().Err(err).Msg("Failed to send response frame")
+			dataFrame := protocol.EncodeFrame(protocol.FrameTypeData, requestID, chunk)
+			if err := h.writeFrame(dataFrame); err != nil {
+				reqLogger.Error().Err(err).Msg("Failed to send response data")
 				responseErr = err
 				break
 			}
@@ -476,26 +494,21 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 	default:
 	}
 
-	// Wait for request streaming to complete with timeout
-	// The goroutine should always send, but a defensive timeout prevents indefinite blocking
-	// Also listen on h.done to allow fast shutdown when connection closes
+	// Wait for request streaming to complete
 	select {
 	case reqErr := <-requestDone:
 		if reqErr != nil && !wasReleased {
 			reqLogger.Error().Err(reqErr).Msg("Request streaming error")
 		}
-		// If released by server, the error is expected - don't log as error
 	case <-h.done:
-		// Connection shutting down, exit immediately
 		reqLogger.Debug().Msg("Connection closing, abandoning request wait")
 	case <-time.After(30 * time.Second):
 		reqLogger.Warn().Msg("Timeout waiting for request goroutine to complete")
 	}
 
-	// Send end frame
+	// Send END frame
 	if responseErr != nil {
 		if wasReleased {
-			// Connection errors after release are expected - don't log as error
 			reqLogger.Debug().Err(responseErr).Msg("Backend connection closed after release")
 		} else {
 			reqLogger.Error().Err(responseErr).Msg("Backend read error")
@@ -509,15 +522,24 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 	}
 }
 
+// serializeResponseHeaders serializes HTTP response headers (no body)
+func serializeResponseHeaders(resp *http.Response) []byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "HTTP/%d.%d %d %s\r\n",
+		resp.ProtoMajor, resp.ProtoMinor, resp.StatusCode, http.StatusText(resp.StatusCode))
+	resp.Header.Write(&buf)
+	buf.WriteString("\r\n")
+	return buf.Bytes()
+}
+
 // sendErrorResponse sends an error response to the server
 func (h *Handler) sendErrorResponse(requestID string, statusCode int, statusText string) {
-	// Minimal HTTP error response
-	errorResponse := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", statusCode, statusText)
-
-	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(errorResponse))
+	// Headers only in START frame
+	headers := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", statusCode, statusText)
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(headers))
 	h.writeFrame(startFrame)
 
-	// Send end frame
+	// No body for error response, just END
 	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
 	h.writeFrame(endFrame)
 }
@@ -526,19 +548,23 @@ func (h *Handler) sendRateLimitResponse(requestID string, limit int) {
 	// Track rate limit rejection
 	h.metrics.incrementRateLimitRejections()
 
-	msg := fmt.Sprintf("Agent concurrent request limit reached (%d)", limit)
-	errorResponse := fmt.Sprintf(
+	body := fmt.Sprintf("Agent concurrent request limit reached (%d)", limit)
+
+	// Headers only in START frame
+	headers := fmt.Sprintf(
 		"HTTP/1.1 429 Too Many Requests\r\n"+
 			"Content-Type: text/plain\r\n"+
-			"Content-Length: %d\r\n\r\n%s",
-		len(msg), msg,
+			"Content-Length: %d\r\n\r\n",
+		len(body),
 	)
-
-	// Send start frame with error response
-	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(errorResponse))
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(headers))
 	h.writeFrame(startFrame)
 
-	// Send end frame
+	// Body in DATA frame
+	dataFrame := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte(body))
+	h.writeFrame(dataFrame)
+
+	// END frame
 	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
 	h.writeFrame(endFrame)
 }
