@@ -3,6 +3,7 @@ package handlers
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -81,7 +82,327 @@ func NewHTTPHandler(
 	return h
 }
 
+// Hop-by-hop headers that should not be forwarded
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+// ServeHTTP implements http.Handler for proxying requests to agents
+func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	finalStatus := 0
+	agentID := ""
+	clientID := ""
+
+	ctx := r.Context()
+
+	// Extract service name from path (/services/<service>/...)
+	service, rewrittenPath := h.extractServiceFromPath(r.URL.Path)
+	if service == "" {
+		h.logger.Error().Str("path", r.URL.Path).Msg("Invalid path - expected /services/<service>/...")
+		http.Error(w, "Invalid path - expected /services/<service>/...", http.StatusBadRequest)
+		return
+	}
+
+	// Check global server rate limit
+	if h.requestSemaphore != nil {
+		select {
+		case h.requestSemaphore <- struct{}{}:
+			defer func() { <-h.requestSemaphore }()
+		default:
+			h.logger.Warn().Str("service", service).Int64("serverLimit", h.maxConcurrentRequests).Msg("Rate limit exceeded for service")
+			h.metricsTracker.IncrementRateLimitRejection(service, "server")
+			finalStatus = http.StatusTooManyRequests
+			http.Error(w, errors.Format(errors.CodeRateLimitExceeded,
+				fmt.Sprintf("Server concurrent request limit reached (%d)", h.maxConcurrentRequests)),
+				http.StatusTooManyRequests)
+			return
+		}
+	}
+
+	h.metricsTracker.IncrementActiveRequests(service)
+	defer func() {
+		h.metricsTracker.DecrementActiveRequests(service)
+		h.metricsTracker.ObserveRequestDuration(service, time.Since(start).Seconds())
+		if finalStatus > 0 {
+			h.metricsTracker.IncrementRequestsTotal(service, agentID, clientID, fmt.Sprintf("%d", finalStatus))
+		}
+	}()
+
+	h.logger.Debug().Str("method", r.Method).Str("path", r.URL.Path).Str("service", service).Msg("HTTP request")
+
+	// Validate client JWT
+	token := r.Header.Get("Authorization")
+	if token == "" {
+		finalStatus = http.StatusUnauthorized
+		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	if strings.HasPrefix(token, "Bearer ") {
+		token = token[7:]
+	} else {
+		finalStatus = http.StatusUnauthorized
+		http.Error(w, "Invalid Authorization header format", http.StatusUnauthorized)
+		return
+	}
+
+	var services []string
+	var err error
+	clientID, services, _, err = h.jwtValidator.ValidateClientJWT(token)
+	if err != nil {
+		h.logger.Error().Err(err).Str("service", service).Msg("Client JWT validation failed")
+		finalStatus = http.StatusUnauthorized
+		http.Error(w, auth.SanitizeJWTError(err), http.StatusUnauthorized)
+		return
+	}
+
+	if !auth.MatchesAny(service, services) {
+		h.logger.Error().Str("clientID", clientID).Str("service", service).Strs("allowedServices", services).Msg("Client not authorized for service")
+		finalStatus = http.StatusForbidden
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	h.logger.Debug().Str("clientID", clientID).Str("service", service).Msg("Client JWT validated")
+
+	// Select agent (round-robin)
+	allAgents := h.agentProvider.GetLocalAgents()
+	type agentEntry struct {
+		id    string
+		agent *agentmgr.Agent
+	}
+	var eligible []agentEntry
+	for id, agent := range allAgents {
+		if agent.ServiceName == service && agent.IsReady() {
+			eligible = append(eligible, agentEntry{id, agent})
+		}
+	}
+
+	if len(eligible) == 0 {
+		finalStatus = http.StatusServiceUnavailable
+		http.Error(w, errors.Format(errors.CodeAgentUnavailable,
+			fmt.Sprintf("No agents available for service %s", service)),
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	sort.Slice(eligible, func(i, j int) bool {
+		return eligible[i].id < eligible[j].id
+	})
+
+	idx := h.rrCounter.Add(1) % uint64(len(eligible))
+	selected := eligible[idx]
+	ag := selected.agent
+	agentID = selected.id
+
+	h.logger.Debug().Str("agentID", agentID).Str("service", service).Int("agentCount", len(eligible)).Msg("Selected agent (round-robin)")
+
+	requestID := uuid.New().String()
+	reqLogger := h.logger.With().Str("requestID", requestID).Str("service", service).Str("agentID", agentID).Str("clientID", clientID).Logger()
+
+	// Register response channel before sending request
+	respCh := ag.RegisterResponseChannel(requestID, h.responseChannelBufferSize)
+	defer ag.CleanupRequest(requestID)
+	defer func() {
+		// Always send CANCEL when handler returns
+		if cancelErr := ag.SendHTTPRequestCancel(requestID); cancelErr != nil {
+			reqLogger.Debug().Err(cancelErr).Msg("Failed to send cancel frame to agent")
+		}
+		h.metricsTracker.IncrementWebsocketMessage("sent", "request_cancel")
+	}()
+
+	// Stream request to agent
+	if err := h.streamRequestToAgent(ctx, ag, requestID, r, rewrittenPath, reqLogger); err != nil {
+		reqLogger.Error().Err(err).Msg("Failed to stream request to agent")
+		finalStatus = http.StatusBadGateway
+		http.Error(w, errors.Format(errors.CodeAgentUnavailable, "Failed to forward request to agent"), http.StatusBadGateway)
+		return
+	}
+
+	// Stream response to client
+	finalStatus = h.streamResponseToClient(ctx, w, respCh, requestID, reqLogger)
+}
+
+// streamRequestToAgent streams the HTTP request to the agent
+func (h *HTTPHandler) streamRequestToAgent(ctx context.Context, ag *agentmgr.Agent, requestID string, r *http.Request, rewrittenPath string, logger zerolog.Logger) error {
+	// Serialize request headers
+	headerBytes, err := serializeRequestHeaders(r, rewrittenPath)
+	if err != nil {
+		return fmt.Errorf("failed to serialize headers: %w", err)
+	}
+
+	logger.Debug().Msg("Sending request headers to agent")
+
+	// Send headers as START frame
+	if err := ag.SendHTTPRequestStart(requestID, headerBytes); err != nil {
+		return fmt.Errorf("failed to send start frame: %w", err)
+	}
+	h.metricsTracker.IncrementWebsocketMessage("sent", "request_start")
+
+	// Stream request body as DATA frames
+	if r.Body != nil {
+		buf := make([]byte, 64*1024)
+		for {
+			select {
+			case <-ctx.Done():
+				ag.SendHTTPRequestEnd(requestID, "client disconnected")
+				return ctx.Err()
+			default:
+			}
+
+			n, readErr := r.Body.Read(buf)
+			if n > 0 {
+				if err := ag.SendHTTPRequestData(requestID, buf[:n]); err != nil {
+					return fmt.Errorf("failed to send data frame: %w", err)
+				}
+				h.metricsTracker.IncrementWebsocketMessage("sent", "request_data")
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return fmt.Errorf("failed to read request body: %w", readErr)
+			}
+		}
+	}
+
+	// Send END frame
+	if err := ag.SendHTTPRequestEnd(requestID, ""); err != nil {
+		return fmt.Errorf("failed to send end frame: %w", err)
+	}
+	h.metricsTracker.IncrementWebsocketMessage("sent", "request_end")
+
+	return nil
+}
+
+// streamResponseToClient streams response frames from agent to the http.ResponseWriter
+func (h *HTTPHandler) streamResponseToClient(ctx context.Context, w http.ResponseWriter, respCh <-chan []byte, requestID string, logger zerolog.Logger) int {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		logger.Error().Msg("ResponseWriter does not support Flusher")
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+
+	idleTimer := time.NewTimer(h.idleTimeout)
+	defer idleTimer.Stop()
+
+	headersSent := false
+	statusCode := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Client disconnected
+			logger.Info().Msg("Client disconnected")
+			return statusCode
+
+		case <-idleTimer.C:
+			logger.Error().Dur("idleTimeout", h.idleTimeout).Msg("Request idle timeout")
+			if !headersSent {
+				http.Error(w, errors.Format(errors.CodeTimeout, "Request timeout"), http.StatusGatewayTimeout)
+			}
+			return http.StatusGatewayTimeout
+
+		case frame, ok := <-respCh:
+			// Reset idle timer
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(h.idleTimeout)
+
+			if !ok {
+				// Channel closed (agent disconnected)
+				if !headersSent {
+					logger.Error().Msg("Request failed: agent disconnected before response")
+					http.Error(w, errors.Format(errors.CodeAgentDisconnect, "Agent disconnected"), http.StatusBadGateway)
+					return http.StatusBadGateway
+				}
+				logger.Debug().Int("statusCode", statusCode).Msg("Request completed")
+				return statusCode
+			}
+
+			frameType, _, payload, err := protocol.DecodeFrame(frame)
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to decode response frame")
+				if !headersSent {
+					http.Error(w, "Invalid response from agent", http.StatusBadGateway)
+				}
+				return http.StatusBadGateway
+			}
+
+			switch frameType {
+			case protocol.FrameTypeStart:
+				// Parse response headers from START frame
+				resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(payload)), nil)
+				if err != nil {
+					logger.Error().Err(err).Msg("Failed to parse response headers")
+					http.Error(w, "Invalid response format", http.StatusBadGateway)
+					return http.StatusBadGateway
+				}
+
+				statusCode = resp.StatusCode
+
+				// Copy headers to ResponseWriter, filtering hop-by-hop headers
+				for key, values := range resp.Header {
+					if hopByHopHeaders[key] {
+						continue
+					}
+					for _, v := range values {
+						w.Header().Add(key, v)
+					}
+				}
+				w.WriteHeader(resp.StatusCode)
+				headersSent = true
+
+				logger.Debug().Int("statusCode", resp.StatusCode).Msg("Sent response headers")
+				h.metricsTracker.IncrementWebsocketMessage("recv", "response_start")
+
+			case protocol.FrameTypeData:
+				if !headersSent {
+					logger.Warn().Msg("Received data frame before start frame")
+					continue
+				}
+
+				if _, err := w.Write(payload); err != nil {
+					logger.Error().Err(err).Msg("Failed to write response chunk to client")
+					return statusCode
+				}
+				flusher.Flush()
+
+				logger.Debug().Int("chunkBytes", len(payload)).Msg("Sent chunk")
+				h.metricsTracker.IncrementWebsocketMessage("recv", "response_data")
+
+			case protocol.FrameTypeEnd:
+				errorMsg := string(payload)
+				if errorMsg != "" {
+					logger.Error().Str("error", errorMsg).Msg("Request ended with error")
+					if !headersSent {
+						http.Error(w, errors.Format(errors.CodeBackendError, errorMsg), http.StatusBadGateway)
+						return http.StatusBadGateway
+					}
+				}
+				logger.Debug().Int("statusCode", statusCode).Msg("Request completed")
+				h.metricsTracker.IncrementWebsocketMessage("recv", "response_end")
+				return statusCode
+			}
+		}
+	}
+}
+
 // HandleTCPConnection handles a raw TCP connection as an HTTP proxy
+// Deprecated: Use ServeHTTP instead
 func (h *HTTPHandler) HandleTCPConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
