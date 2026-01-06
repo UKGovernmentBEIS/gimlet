@@ -23,11 +23,9 @@ Gimlet uses **outbound-initiated connections** to avoid firewall/NAT issues:
 This is the opposite of a traditional VPN where you connect TO a network—here, specific services are **pulled out** to be reachable while everything else stays private.
 
 > [!IMPORTANT]
-> **Backend protocol must match the client-facing protocol.** Gimlet is a "dumb pipe"—it forwards raw TCP bytes without protocol translation.
+> **Gimlet forwards HTTP requests and responses.** The server and agent handle HTTP protocol details (headers, chunked encoding, etc.) automatically.
 >
 > If your load balancer terminates TLS and forwards HTTP to the Gimlet server, your backends must also speak HTTP. If you need HTTPS backends (e.g., with self-signed certificates), the entire path must be HTTPS: client → load balancer → Gimlet server → agent → backend.
->
-> All services behind a single Gimlet deployment must use the same protocol.
 
 ---
 
