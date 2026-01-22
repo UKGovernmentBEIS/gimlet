@@ -2,8 +2,10 @@
 
 import pytest
 from datetime import timedelta
+from pathlib import Path
 
 from gimlet.jwt import parse_duration
+from gimlet.cli import _validate_signing_key_options
 
 
 class TestParseDuration:
@@ -64,3 +66,32 @@ class TestParseDuration:
             parse_duration("-1h")
         with pytest.raises(ValueError, match="non-negative"):
             parse_duration("-24h")
+
+
+class TestValidateSigningKeyOptions:
+    """Tests for _validate_signing_key_options function."""
+
+    def test_valid_kms_key_only(self):
+        """KMS key alone should pass validation."""
+        _validate_signing_key_options(None, "arn:aws:kms:us-east-1:123:key/test")
+
+    def test_valid_private_key_only(self):
+        """Private key file alone should pass validation."""
+        _validate_signing_key_options(Path("/some/key.pem"), None)
+
+    def test_both_options_raises(self):
+        """Both options provided should raise error."""
+        with pytest.raises(SystemExit):
+            _validate_signing_key_options(
+                Path("/some/key.pem"), "arn:aws:kms:us-east-1:123:key/test"
+            )
+
+    def test_neither_option_raises(self):
+        """No options provided should raise error."""
+        with pytest.raises(SystemExit):
+            _validate_signing_key_options(None, None)
+
+    def test_empty_kms_string_raises(self):
+        """Empty KMS string (e.g., from unset env var) should raise error."""
+        with pytest.raises(SystemExit):
+            _validate_signing_key_options(None, "")

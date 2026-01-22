@@ -13,8 +13,8 @@ from . import jwt as jwt_utils
 
 def _validate_signing_key_options(private_key_file: Path | None, kms_key_arn: str | None) -> None:
     """Validate that exactly one signing key option is provided."""
-    has_private_key = private_key_file is not None
-    has_kms = kms_key_arn is not None
+    has_private_key = bool(private_key_file)
+    has_kms = bool(kms_key_arn)
 
     if has_private_key and has_kms:
         click.echo("Error: --private-key-file and --kms-key-arn are mutually exclusive", err=True)
