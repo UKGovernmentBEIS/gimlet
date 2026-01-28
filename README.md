@@ -14,18 +14,19 @@ Gimlet uses **outbound-initiated connections** to avoid firewall/NAT issues:
 4. **Responses flow back** through the same tunnel
 
 ```
-┌────────┐   HTTPS   ┌────────┐  WebSocket  ┌───────┐   HTTP   ┌─────────┐
-│ Client │──────────▶│ Server │◀────────────│ Agent │─────────▶│ Backend │
-└────────┘           └────────┘             └───────┘          └─────────┘
-  (you)             (public net)            (private)           (private)
+                       TLS termination
+┌────────┐   HTTPS   ┌──────────────┐  HTTP   ┌────────┐  WebSocket  ┌───────┐   HTTP   ┌─────────┐
+│ Client │──────────▶│ Load Balancer│────────▶│ Server │◀────────────│ Agent │─────────▶│ Backend │
+└────────┘           └──────────────┘         └────────┘             └───────┘          └─────────┘
+  (you)                                      (public net)            (private)           (private)
 ```
 
 This is the opposite of a traditional VPN where you connect TO a network—here, specific services are **pulled out** to be reachable while everything else stays private.
 
 > [!IMPORTANT]
-> **Gimlet forwards HTTP requests and responses.** The server and agent handle HTTP protocol details (headers, chunked encoding, etc.) automatically.
+> **The Gimlet server listens on plain HTTP only.** You must deploy a TLS-terminating load balancer (AWS ALB, nginx, etc.) in front of it to provide HTTPS for clients.
 >
-> If your load balancer terminates TLS and forwards HTTP to the Gimlet server, your backends must also speak HTTP. If you need HTTPS backends (e.g., with self-signed certificates), the entire path must be HTTPS: client → load balancer → Gimlet server → agent → backend.
+> Gimlet forwards HTTP requests and responses. The server and agent handle HTTP protocol details (headers, chunked encoding, etc.) automatically. Your backends must speak HTTP—HTTPS backends are not currently supported.
 
 ---
 
