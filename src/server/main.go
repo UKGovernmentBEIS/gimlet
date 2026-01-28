@@ -25,6 +25,9 @@ import (
 )
 
 var (
+	// CheckOrigin returns true for all requests because authentication is handled
+	// via JWT tokens in the Authorization header, not via origin checking.
+	// Origin-based security is unnecessary when using bearer token authentication.
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
