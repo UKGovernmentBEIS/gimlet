@@ -23,7 +23,7 @@ import (
 
 // AgentProvider provides access to local agents
 type AgentProvider interface {
-	GetLocalAgents() map[string]*agentmgr.Agent
+	LocalAgents() map[string]*agentmgr.Agent
 }
 
 // HTTPHandler handles HTTP requests with streaming responses
@@ -173,7 +173,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger.Debug().Str("clientID", clientID).Str("service", service).Msg("Client JWT validated")
 
 	// Select agent (round-robin)
-	allAgents := h.agentProvider.GetLocalAgents()
+	allAgents := h.agentProvider.LocalAgents()
 	type agentEntry struct {
 		id    string
 		agent *agentmgr.Agent

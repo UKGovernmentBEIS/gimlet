@@ -87,13 +87,13 @@ func (m *MockWebSocketConn) SetWriteDeadline(t time.Time) error {
 	return nil // Mock implementation, no-op for tests
 }
 
-func (m *MockWebSocketConn) GetWriteCalls() []interface{} {
+func (m *MockWebSocketConn) WriteCalls() []interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]interface{}{}, m.writeCalls...)
 }
 
-func (m *MockWebSocketConn) GetBinaryWrites() [][]byte {
+func (m *MockWebSocketConn) BinaryWrites() [][]byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([][]byte{}, m.binaryWrites...)

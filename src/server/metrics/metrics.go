@@ -217,12 +217,12 @@ type AgentMetricsSnapshot struct {
 
 // ServerInfo provides server state for health/metrics reporting
 type ServerInfo interface {
-	GetAgentCounts() map[string]int
-	GetActiveRequestCount() int
-	GetServerID() string
-	GetStartTime() time.Time
-	GetAgentBufferStats() []AgentBufferStat
-	GetAgentMetrics() []AgentMetricsSnapshot
+	AgentCounts() map[string]int
+	ActiveRequestCount() int
+	ServerID() string
+	StartTime() time.Time
+	AgentBufferStats() []AgentBufferStat
+	AgentMetrics() []AgentMetricsSnapshot
 }
 
 // HealthHandler returns a health check endpoint handler
@@ -230,10 +230,10 @@ func HealthHandler(server ServerInfo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		health := map[string]interface{}{
 			"status":          "healthy",
-			"server_id":       server.GetServerID(),
-			"uptime":          time.Since(server.GetStartTime()).String(),
-			"agents":          server.GetAgentCounts(),
-			"active_requests": server.GetActiveRequestCount(),
+			"server_id":       server.ServerID(),
+			"uptime":          time.Since(server.StartTime()).String(),
+			"agents":          server.AgentCounts(),
+			"active_requests": server.ActiveRequestCount(),
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -247,18 +247,18 @@ func UpdateLoop(m *Metrics, server ServerInfo, interval time.Duration) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		serviceCounts := server.GetAgentCounts()
+		serviceCounts := server.AgentCounts()
 		for service, count := range serviceCounts {
 			m.AgentConnections.WithLabelValues(service).Set(float64(count))
 		}
 
-		bufferStats := server.GetAgentBufferStats()
+		bufferStats := server.AgentBufferStats()
 		for _, stat := range bufferStats {
 			m.ResponseChannelBuffer.WithLabelValues(stat.Service, stat.AgentID).Set(float64(stat.BufferUsage))
 		}
 
 		// Update agent-reported metrics
-		agentMetrics := server.GetAgentMetrics()
+		agentMetrics := server.AgentMetrics()
 		for _, am := range agentMetrics {
 			m.AgentRateLimitRejections.WithLabelValues(am.Service, am.AgentID).Set(float64(am.RateLimitRejections))
 			m.AgentConcurrentRequests.WithLabelValues(am.Service, am.AgentID).Set(float64(am.ConcurrentRequests))

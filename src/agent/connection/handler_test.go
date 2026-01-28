@@ -233,7 +233,7 @@ func (m *mockRequestTracker) DecrementRequests() {
 	atomic.AddInt32(&m.count, -1)
 }
 
-func (m *mockRequestTracker) GetCount() int32 {
+func (m *mockRequestTracker) Count() int32 {
 	return atomic.LoadInt32(&m.count)
 }
 
@@ -327,8 +327,8 @@ func TestCancelAfterEndProcessed(t *testing.T) {
 	// Verify request tracker shows 0 in-flight requests
 	// Allow a brief moment for final cleanup
 	time.Sleep(50 * time.Millisecond)
-	if tracker.GetCount() != 0 {
-		t.Errorf("Expected 0 in-flight requests, got %d", tracker.GetCount())
+	if tracker.Count() != 0 {
+		t.Errorf("Expected 0 in-flight requests, got %d", tracker.Count())
 	}
 }
 
@@ -473,8 +473,8 @@ func TestResponseDoneSignalsRequestGoroutine(t *testing.T) {
 	<-handlerDone
 
 	// Verify clean exit
-	if tracker.GetCount() != 0 {
-		t.Errorf("Expected 0 in-flight requests after completion, got %d", tracker.GetCount())
+	if tracker.Count() != 0 {
+		t.Errorf("Expected 0 in-flight requests after completion, got %d", tracker.Count())
 	}
 }
 
