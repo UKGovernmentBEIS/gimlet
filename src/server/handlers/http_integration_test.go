@@ -25,7 +25,7 @@ type testAgentProvider struct {
 	agents map[string]*agentmgr.Agent
 }
 
-func (m *testAgentProvider) GetLocalAgents() map[string]*agentmgr.Agent {
+func (m *testAgentProvider) LocalAgents() map[string]*agentmgr.Agent {
 	return m.agents
 }
 

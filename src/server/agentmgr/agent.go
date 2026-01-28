@@ -63,8 +63,8 @@ func NewAgent(id, serviceName string, conn protocol.WebSocketConn) *Agent {
 	}
 }
 
-// GetLoad returns the current number of active requests (thread-safe)
-func (a *Agent) GetLoad() int {
+// Load returns the current number of active requests (thread-safe)
+func (a *Agent) Load() int {
 	a.RespLock.Lock()
 	defer a.RespLock.Unlock()
 	return len(a.requests)
@@ -181,8 +181,8 @@ func (a *Agent) SetReady(ready bool) {
 	a.Ready = ready
 }
 
-// GetBufferUsage returns the total number of buffered frames across all active requests
-func (a *Agent) GetBufferUsage() int {
+// BufferUsage returns the total number of buffered frames across all active requests
+func (a *Agent) BufferUsage() int {
 	a.RespLock.Lock()
 	defer a.RespLock.Unlock()
 

@@ -50,7 +50,7 @@ type Server struct {
 }
 
 // Implement handlers.AgentProvider interface
-func (cs *Server) GetLocalAgents() map[string]*agentmgr.Agent {
+func (cs *Server) LocalAgents() map[string]*agentmgr.Agent {
 	cs.agentsLock.RLock()
 	defer cs.agentsLock.RUnlock()
 
@@ -63,7 +63,7 @@ func (cs *Server) GetLocalAgents() map[string]*agentmgr.Agent {
 }
 
 // Implement metrics.ServerInfo interface
-func (cs *Server) GetAgentCounts() map[string]int {
+func (cs *Server) AgentCounts() map[string]int {
 	cs.agentsLock.RLock()
 	defer cs.agentsLock.RUnlock()
 
@@ -74,26 +74,26 @@ func (cs *Server) GetAgentCounts() map[string]int {
 	return serviceCounts
 }
 
-func (cs *Server) GetActiveRequestCount() int {
+func (cs *Server) ActiveRequestCount() int {
 	cs.agentsLock.RLock()
 	defer cs.agentsLock.RUnlock()
 
 	total := 0
 	for _, ag := range cs.agents {
-		total += ag.GetLoad()
+		total += ag.Load()
 	}
 	return total
 }
 
-func (cs *Server) GetServerID() string {
+func (cs *Server) ServerID() string {
 	return cs.serverID
 }
 
-func (cs *Server) GetStartTime() time.Time {
+func (cs *Server) StartTime() time.Time {
 	return cs.startTime
 }
 
-func (cs *Server) GetAgentBufferStats() []metrics.AgentBufferStat {
+func (cs *Server) AgentBufferStats() []metrics.AgentBufferStat {
 	cs.agentsLock.RLock()
 	defer cs.agentsLock.RUnlock()
 
@@ -102,13 +102,13 @@ func (cs *Server) GetAgentBufferStats() []metrics.AgentBufferStat {
 		stats = append(stats, metrics.AgentBufferStat{
 			Service:     ag.ServiceName,
 			AgentID:     ag.ID,
-			BufferUsage: ag.GetBufferUsage(),
+			BufferUsage: ag.BufferUsage(),
 		})
 	}
 	return stats
 }
 
-func (cs *Server) GetAgentMetrics() []metrics.AgentMetricsSnapshot {
+func (cs *Server) AgentMetrics() []metrics.AgentMetricsSnapshot {
 	cs.agentsLock.RLock()
 	defer cs.agentsLock.RUnlock()
 
@@ -178,7 +178,7 @@ func (cs *Server) logStatsLoop(interval time.Duration) {
 				serviceStats[ag.ServiceName] = map[string]int{"agents": 0, "requests": 0}
 			}
 			serviceStats[ag.ServiceName]["agents"]++
-			serviceStats[ag.ServiceName]["requests"] += ag.GetLoad()
+			serviceStats[ag.ServiceName]["requests"] += ag.Load()
 		}
 
 		activeRequests := 0
