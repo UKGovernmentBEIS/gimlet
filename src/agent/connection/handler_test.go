@@ -535,6 +535,208 @@ func TestDeliverFrameRaceSafety(t *testing.T) {
 	}
 }
 
+// slowWriteConn wraps a net.Conn to delay writes, simulating a slow backend
+type slowWriteConn struct {
+	net.Conn
+	writeDelay   time.Duration
+	writeCalled  chan struct{}
+	allowWrite   chan struct{}
+	bytesWritten int
+	mu           sync.Mutex
+}
+
+func (s *slowWriteConn) Write(b []byte) (int, error) {
+	// Signal that write was called
+	select {
+	case s.writeCalled <- struct{}{}:
+	default:
+	}
+
+	// Wait for permission to complete (or timeout)
+	select {
+	case <-s.allowWrite:
+	case <-time.After(s.writeDelay):
+	}
+
+	s.mu.Lock()
+	s.bytesWritten += len(b)
+	s.mu.Unlock()
+
+	return s.Conn.Write(b)
+}
+
+// slowWriteDialer returns connections that delay writes
+type slowWriteDialer struct {
+	listener     net.Listener
+	writeDelay   time.Duration
+	lastConn     *slowWriteConn
+	writeCalled  chan struct{}
+	allowWrite   chan struct{}
+	mu           sync.Mutex
+}
+
+func (d *slowWriteDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, d.listener.Addr().String(), timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	slowConn := &slowWriteConn{
+		Conn:        conn,
+		writeDelay:  d.writeDelay,
+		writeCalled: d.writeCalled,
+		allowWrite:  d.allowWrite,
+	}
+
+	d.mu.Lock()
+	d.lastConn = slowConn
+	d.mu.Unlock()
+
+	return slowConn, nil
+}
+
+// TestResponseDoneRaceCondition tests the race condition where response streaming
+// completes while the request goroutine is blocked on conn.Write() with an END
+// frame buffered. Without the fix, this would cause a 30s timeout wait.
+// This is a regression test for the "Timeout waiting for request goroutine to complete" issue.
+func TestResponseDoneRaceCondition(t *testing.T) {
+	// Create a backend that:
+	// 1. Accepts connection
+	// 2. Waits to read (so agent's conn.Write blocks due to TCP backpressure)
+	// 3. Eventually reads and sends response
+	// 4. Closes connection (triggers responseDone)
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start mock backend: %v", err)
+	}
+	defer backendListener.Close()
+
+	backendConnected := make(chan struct{})
+	backendAllowRead := make(chan struct{})
+	backendDone := make(chan struct{})
+
+	go func() {
+		defer close(backendDone)
+		conn, err := backendListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Signal that connection was accepted
+		close(backendConnected)
+
+		// Wait before reading - this causes TCP backpressure on agent's writes
+		<-backendAllowRead
+
+		// Read the request
+		buf := make([]byte, 4096)
+		conn.Read(buf)
+
+		// Send response and close immediately (triggers responseDone on agent)
+		response := "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok"
+		conn.Write([]byte(response))
+	}()
+
+	// Create channels for coordinating the slow write
+	writeCalled := make(chan struct{}, 10)
+	allowWrite := make(chan struct{})
+
+	dialer := &slowWriteDialer{
+		listener:    backendListener,
+		writeDelay:  10 * time.Second, // Long delay to ensure we control timing
+		writeCalled: writeCalled,
+		allowWrite:  allowWrite,
+	}
+
+	mockWS := newMockWebSocketConn()
+	tracker := &mockRequestTracker{}
+	semaphore := make(chan struct{}, 10)
+
+	handler := NewHandler(mockWS, backendListener.Addr().String(), dialer, tracker, zerolog.New(io.Discard), 10, semaphore, 100)
+
+	// Start handler
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.Run()
+		close(handlerDone)
+	}()
+
+	requestID := "race-test-request"
+
+	// Send START frame with a request body - this triggers the dial to backend
+	httpRequest := "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n"
+	startFrame := protocol.EncodeFrame(protocol.FrameTypeStart, requestID, []byte(httpRequest))
+	mockWS.sendFrame(startFrame)
+
+	// Wait for backend to accept connection (dial happened)
+	select {
+	case <-backendConnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for backend connection")
+	}
+
+	// Wait for the first write to be called (START frame payload being written)
+	select {
+	case <-writeCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for first write")
+	}
+
+	// Now send DATA frame - this will also try to write to blocked backend
+	dataFrame := protocol.EncodeFrame(protocol.FrameTypeData, requestID, []byte("some request body data"))
+	mockWS.sendFrame(dataFrame)
+
+	// Give time for DATA to be queued
+	time.Sleep(50 * time.Millisecond)
+
+	// Send END frame - this gets BUFFERED in frameCh while request goroutine is blocked
+	endFrame := protocol.EncodeFrame(protocol.FrameTypeEnd, requestID, []byte(""))
+	mockWS.sendFrame(endFrame)
+
+	// Give time for END to be buffered
+	time.Sleep(50 * time.Millisecond)
+
+	// Now unblock the backend reads AND allow writes to complete
+	close(backendAllowRead)
+	close(allowWrite)
+
+	// The backend will now:
+	// 1. Read the request
+	// 2. Send response
+	// 3. Close connection
+	// This triggers responseDone on the agent
+
+	// Wait for backend to finish
+	<-backendDone
+
+	// KEY ASSERTION: The handler should complete quickly, NOT wait 30 seconds
+	// If the fix is not in place, this would timeout after 30+ seconds
+	cleanupStart := time.Now()
+
+	// Close the WebSocket to trigger handler shutdown
+	time.Sleep(100 * time.Millisecond)
+	mockWS.Close()
+
+	select {
+	case <-handlerDone:
+		cleanupDuration := time.Since(cleanupStart)
+		// Should complete well under 5 seconds (the short timeout path)
+		// With the fix, it should be nearly instant
+		if cleanupDuration > 3*time.Second {
+			t.Errorf("Handler took too long to clean up (%v) - possible timeout path hit", cleanupDuration)
+		}
+		t.Logf("Handler cleanup completed in %v", cleanupDuration)
+	case <-time.After(35 * time.Second):
+		t.Fatal("Handler did not exit - likely stuck in 30s timeout wait (race condition not fixed)")
+	}
+
+	// Verify request tracker is clean
+	if tracker.Count() != 0 {
+		t.Errorf("Expected 0 in-flight requests, got %d", tracker.Count())
+	}
+}
+
 // TestDeliverFrameDoneChannelUnblocks tests that closing the done channel
 // unblocks a pending deliverFrame call (simulates handler exit during delivery).
 func TestDeliverFrameDoneChannelUnblocks(t *testing.T) {
