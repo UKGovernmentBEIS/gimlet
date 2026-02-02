@@ -707,14 +707,18 @@ func TestResponseDoneRaceCondition(t *testing.T) {
 	// 3. Close connection
 	// This triggers responseDone on the agent
 
-	// Wait for backend to finish
-	<-backendDone
+	// Wait for backend to finish (with timeout to prevent test hangs)
+	select {
+	case <-backendDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for backend to finish")
+	}
 
 	// KEY ASSERTION: The handler should complete quickly, NOT wait 30 seconds
 	// If the fix is not in place, this would timeout after 30+ seconds
 	cleanupStart := time.Now()
 
-	// Close the WebSocket to trigger handler shutdown
+	// Close the WebSocket to trigger handler shutdown and measure cleanup time
 	time.Sleep(100 * time.Millisecond)
 	mockWS.Close()
 
