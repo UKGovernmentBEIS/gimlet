@@ -418,6 +418,11 @@ func (h *Handler) handleHTTPRequest(requestID string, frameCh <-chan []byte) {
 				}
 
 			case <-responseDone:
+				// Response streaming completed - signal completion if END wasn't received
+				// This prevents the main handler from waiting 30s for requestDone
+				if !endReceived {
+					requestDone <- nil // Response done, request streaming no longer needed
+				}
 				return
 			}
 		}
