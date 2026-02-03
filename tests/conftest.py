@@ -31,28 +31,38 @@ def wait_for_services(auth_headers):
 
     This ensures full-mesh topology is established and both model-v1
     and model-v2 services have connected agents. Requires multiple
-    consecutive successes to confirm stability.
+    consecutive successes where ALL services respond 200 simultaneously.
     """
-    services = ["model-v1", "model-v2"]
+    services = {
+        "model-v1": f"{BASE_URL}/services/model-v1/headers",
+        "model-v2": f"{BASE_URL}/services/model-v2/",
+    }
     timeout = 60  # Max seconds to wait
-    required_successes = 3  # Consecutive successes needed per service
+    required_successes = 5  # Consecutive successes where ALL services are healthy
     start = time.time()
+    consecutive_successes = 0
 
-    for service in services:
-        url = f"{BASE_URL}/services/{service}/headers" if service == "model-v1" else f"{BASE_URL}/services/{service}/"
-        consecutive_successes = 0
-
-        while time.time() - start < timeout:
+    while time.time() - start < timeout:
+        all_healthy = True
+        for service, url in services.items():
             try:
                 resp = requests.get(url, headers=auth_headers, timeout=2)
-                if resp.status_code == 200:
-                    consecutive_successes += 1
-                    if consecutive_successes >= required_successes:
-                        break
-                else:
-                    consecutive_successes = 0  # Reset on non-200
+                if resp.status_code != 200:
+                    all_healthy = False
+                    break
             except requests.RequestException:
-                consecutive_successes = 0  # Reset on error
-            time.sleep(0.5)
+                all_healthy = False
+                break
+
+        if all_healthy:
+            consecutive_successes += 1
+            if consecutive_successes >= required_successes:
+                # All services stable - add brief stabilization delay
+                time.sleep(1)
+                return
         else:
-            pytest.fail(f"Service {service} not stable after {timeout}s. Is infrastructure running? (make up)")
+            consecutive_successes = 0  # Reset on any failure
+
+        time.sleep(0.5)
+
+    pytest.fail(f"Services not stable after {timeout}s. Is infrastructure running? (make up)")

@@ -621,7 +621,27 @@ def test_server_graceful_shutdown_drains_requests():
     print("Stopping server-1 to isolate server-2...")
     server_1 = get_container("server-1")
     server_1.stop()
-    time.sleep(3)  # Wait for agents to detect disconnect
+
+    # Wait for system to stabilize:
+    # - Agents need to detect server-1 disconnect (~5s ping/pong timeout)
+    # - Agents need to re-establish connections to server-2
+    # - nginx DNS cache needs to refresh (valid=10s in config)
+    print("Waiting for agents to reconnect to server-2 (15s)...")
+    time.sleep(15)
+
+    # Verify server-2 is actually serving requests before proceeding
+    print("Verifying server-2 is serving requests...")
+    for attempt in range(5):
+        try:
+            resp = _make_request("GET", "/headers", "model-v1", timeout=3)
+            if resp.status_code == 200:
+                print(f"  Server-2 verified ready (attempt {attempt + 1})")
+                break
+        except Exception as e:
+            print(f"  Attempt {attempt + 1} failed: {e}")
+        time.sleep(2)
+    else:
+        pytest.fail("Server-2 not ready after stopping server-1")
 
     # Start a slow request (10s delay)
     print("Starting slow request (10s delay) - will go to server-2...")
