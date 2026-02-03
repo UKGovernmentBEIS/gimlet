@@ -28,6 +28,10 @@ services:
       - GIMLET_AGENT_TOKEN_FILE=/keys/agent-v1-1.jwt
       - GIMLET_AGENT_LOG_LEVEL=DEBUG
       - GIMLET_AGENT_MAX_CONCURRENT_REQUESTS=30  # Allows E2E tests (~25 per agent) + room for rate limit testing
+      - GIMLET_AGENT_HEALTH_CHECK_PATH=/headers  # httpbun returns 200 on /headers
+      - GIMLET_AGENT_HEALTH_CHECK_INTERVAL=2s
+      - GIMLET_AGENT_HEALTH_CHECK_FAILURE_THRESHOLD=2
+      - GIMLET_AGENT_HEALTH_CHECK_SUCCESS_THRESHOLD=1
     volumes:
       - ../../bin:/app:ro
       - ./credentials:/keys:ro
@@ -47,6 +51,10 @@ services:
       - GIMLET_AGENT_TOKEN_FILE=/keys/agent-v1-2.jwt
       - GIMLET_AGENT_LOG_LEVEL=DEBUG
       - GIMLET_AGENT_MAX_CONCURRENT_REQUESTS=30  # Allows E2E tests (~25 per agent) + room for rate limit testing
+      - GIMLET_AGENT_HEALTH_CHECK_PATH=/headers  # httpbun returns 200 on /headers
+      - GIMLET_AGENT_HEALTH_CHECK_INTERVAL=2s
+      - GIMLET_AGENT_HEALTH_CHECK_FAILURE_THRESHOLD=2
+      - GIMLET_AGENT_HEALTH_CHECK_SUCCESS_THRESHOLD=1
     volumes:
       - ../../bin:/app:ro
       - ./credentials:/keys:ro
@@ -71,6 +79,10 @@ services:
       - GIMLET_AGENT_TARGET_URL=http://backend-v2
       - GIMLET_AGENT_TOKEN_FILE=/keys/agent-v2-1.jwt
       - GIMLET_AGENT_MAX_CONCURRENT_REQUESTS=30  # Allows E2E tests (~25 per agent) + room for rate limit testing
+      - GIMLET_AGENT_HEALTH_CHECK_PATH=/  # nginx returns 200 on /
+      - GIMLET_AGENT_HEALTH_CHECK_INTERVAL=2s
+      - GIMLET_AGENT_HEALTH_CHECK_FAILURE_THRESHOLD=2
+      - GIMLET_AGENT_HEALTH_CHECK_SUCCESS_THRESHOLD=1
     volumes:
       - ../../bin:/app:ro
       - ./credentials:/keys:ro
