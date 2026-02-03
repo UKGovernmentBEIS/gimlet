@@ -171,14 +171,19 @@ func (cs *Server) logStatsLoop(interval time.Duration) {
 		cs.agentsLock.RLock()
 		agentCount := len(cs.agents)
 
-		// Build per-service stats
+		// Build per-service stats including ready/not_ready counts
 		serviceStats := make(map[string]map[string]int)
 		for _, ag := range cs.agents {
 			if _, exists := serviceStats[ag.ServiceName]; !exists {
-				serviceStats[ag.ServiceName] = map[string]int{"agents": 0, "requests": 0}
+				serviceStats[ag.ServiceName] = map[string]int{"agents": 0, "ready": 0, "not_ready": 0, "requests": 0}
 			}
 			serviceStats[ag.ServiceName]["agents"]++
 			serviceStats[ag.ServiceName]["requests"] += ag.Load()
+			if ag.IsReady() {
+				serviceStats[ag.ServiceName]["ready"]++
+			} else {
+				serviceStats[ag.ServiceName]["not_ready"]++
+			}
 		}
 
 		activeRequests := 0
@@ -493,13 +498,19 @@ func (cs *Server) handleAgentMessages(ag *agentmgr.Agent) {
 
 			if msgType == "ready" {
 				ag.SetReady(true)
-				cs.logger.Info().Str("agentID", ag.ID).Msg("Agent is now ready to accept requests")
+				cs.logger.Info().Str("agentID", ag.ID).Str("state", "ready").Msg("Agent state changed")
+				continue
+			}
+
+			if msgType == "not_ready" {
+				ag.SetReady(false)
+				cs.logger.Info().Str("agentID", ag.ID).Str("state", "not_ready").Msg("Agent state changed")
 				continue
 			}
 
 			if msgType == "draining" {
 				ag.SetReady(false)
-				cs.logger.Info().Str("agentID", ag.ID).Msg("Agent is draining (no new requests, finishing existing)")
+				cs.logger.Info().Str("agentID", ag.ID).Str("state", "draining").Msg("Agent state changed")
 				continue
 			}
 

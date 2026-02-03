@@ -15,6 +15,7 @@ import (
 
 	"gimlet/agent/config"
 	"gimlet/agent/connection"
+	"gimlet/agent/health"
 	"gimlet/agent/messages"
 	"gimlet/protocol"
 
@@ -37,9 +38,11 @@ type AgentState struct {
 	mu               sync.RWMutex
 	inflightRequests atomic.Int32   // Count of in-flight backend requests
 	draining         atomic.Bool    // Whether agent is draining
+	backendHealthy   atomic.Bool    // Whether backend health check is passing
 	requestSemaphore chan struct{}  // Shared rate limit semaphore (global per agent)
 	wsDialer         protocol.WebSocketDialer
 	tcpDialer        connection.TCPDialer
+	healthChecker    *health.Checker
 	logger           zerolog.Logger
 }
 
@@ -97,10 +100,24 @@ func main() {
 	baseLogger.Info().Dur("interval", cfg.ConnectionCheckInterval).Msg("Connection probe interval configured")
 	baseLogger.Info().Int("maxConcurrentRequests", cfg.MaxConcurrentRequests).Msg("Max concurrent requests per agent configured (0 = unlimited)")
 	baseLogger.Info().Int("bufferSize", cfg.RequestBufferSize).Msg("Request channel buffer size configured")
+	baseLogger.Info().
+		Str("url", cfg.HealthCheckURL()).
+		Dur("interval", cfg.HealthCheckInterval).
+		Dur("timeout", cfg.HealthCheckTimeout).
+		Str("codes", cfg.HealthCheckCodes).
+		Int("failureThreshold", cfg.HealthCheckFailureThreshold).
+		Int("successThreshold", cfg.HealthCheckSuccessThreshold).
+		Msg("Health check configured")
 
 	// Parse target URL to extract host:port for TCP connections
 	targetAddr := cfg.ParseTargetAddr()
 	baseLogger.Info().Str("targetAddr", targetAddr).Msg("Target backend TCP address")
+
+	// Parse health check status codes
+	statusMatcher, err := health.ParseStatusCodes(cfg.HealthCheckCodes)
+	if err != nil {
+		baseLogger.Fatal().Err(err).Str("codes", cfg.HealthCheckCodes).Msg("Invalid health check status codes")
+	}
 
 	// Initialize shared state with default dialers
 	state := &AgentState{
@@ -116,6 +133,20 @@ func main() {
 		baseLogger.Info().Msg("Shared rate limit semaphore initialized (global per agent)")
 	}
 
+	// Initialize and start health checker
+	state.healthChecker = health.NewChecker(health.Config{
+		URL:              cfg.HealthCheckURL(),
+		Interval:         cfg.HealthCheckInterval,
+		Timeout:          cfg.HealthCheckTimeout,
+		FailureThreshold: cfg.HealthCheckFailureThreshold,
+		SuccessThreshold: cfg.HealthCheckSuccessThreshold,
+		StatusMatcher:    statusMatcher,
+	}, baseLogger)
+	state.healthChecker.Start()
+
+	// Watch for health state changes and broadcast to all connected servers
+	go watchHealthState(state)
+
 	// Start connection monitor
 	go monitorConnections(state, cfg.ServerURL, token, targetAddr, cfg.ConnectionCheckInterval, cfg.MaxConcurrentRequests, cfg.RequestBufferSize)
 
@@ -128,8 +159,9 @@ func main() {
 	sig := <-sigChan
 	state.logger.Info().Str("signal", sig.String()).Msg("Received signal, initiating graceful shutdown")
 
-	// Mark as draining
+	// Mark as draining and stop health checker
 	state.draining.Store(true)
+	state.healthChecker.Stop()
 
 	// Send draining message to all connected servers
 	state.mu.RLock()
@@ -170,7 +202,19 @@ func sendReady(conn connection.WebSocketConn, serverID string, logger zerolog.Lo
 	if err := conn.WriteJSON(readyMsg); err != nil {
 		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send ready message to server")
 	} else {
-		logger.Info().Str("serverID", serverID).Msg("Sent ready message to server")
+		logger.Debug().Str("serverID", serverID).Msg("Sent ready message to server")
+	}
+}
+
+func sendNotReady(conn connection.WebSocketConn, serverID string, logger zerolog.Logger) {
+	notReadyMsg := messages.StateChangeMessage{
+		Type:  "not_ready",
+		State: "not_ready",
+	}
+	if err := conn.WriteJSON(notReadyMsg); err != nil {
+		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send not_ready message to server")
+	} else {
+		logger.Debug().Str("serverID", serverID).Msg("Sent not_ready message to server")
 	}
 }
 
@@ -182,7 +226,7 @@ func sendDraining(conn connection.WebSocketConn, serverID string, logger zerolog
 	if err := conn.WriteJSON(drainingMsg); err != nil {
 		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send draining message to server")
 	} else {
-		logger.Info().Str("serverID", serverID).Msg("Sent draining message to server")
+		logger.Debug().Str("serverID", serverID).Msg("Sent draining message to server")
 	}
 }
 
@@ -201,10 +245,15 @@ func logStatsLoop(state *AgentState, interval time.Duration) {
 		state.mu.RUnlock()
 
 		activeRequests := state.inflightRequests.Load()
+		healthState := "unknown"
+		if state.healthChecker != nil {
+			healthState = string(state.healthChecker.CurrentState())
+		}
 
 		logEvent := state.logger.Info().
 			Int("servers", serverCount).
-			Int32("activeRequests", activeRequests)
+			Int32("activeRequests", activeRequests).
+			Str("backendHealth", healthState)
 
 		// Include semaphore usage if rate limiting is enabled
 		if state.requestSemaphore != nil {
@@ -212,6 +261,30 @@ func logStatsLoop(state *AgentState, interval time.Duration) {
 		}
 
 		logEvent.Msg("Agent stats")
+	}
+}
+
+// watchHealthState monitors health checker state changes and broadcasts to all servers
+func watchHealthState(state *AgentState) {
+	for newState := range state.healthChecker.StateChanges() {
+		if state.draining.Load() {
+			return
+		}
+
+		// Update local health state
+		isHealthy := newState == health.StateHealthy
+		state.backendHealthy.Store(isHealthy)
+
+		// Broadcast to all connected servers
+		state.mu.RLock()
+		for _, connInfo := range state.connections {
+			if isHealthy {
+				sendReady(connInfo.conn, connInfo.serverID, state.logger)
+			} else {
+				sendNotReady(connInfo.conn, connInfo.serverID, state.logger)
+			}
+		}
+		state.mu.RUnlock()
 	}
 }
 
@@ -324,11 +397,15 @@ func tryConnect(state *AgentState, serverURL, token string, targetAddr string, m
 	// Add connection to state (use wrapped conn for thread-safe writes during shutdown)
 	state.addConnection(hello.ServerID, hello.ServiceName, hello.AgentID, wrappedConn, handler)
 
-	// Send ready message BEFORE starting concurrent goroutines
+	// Send current health state BEFORE starting concurrent goroutines
 	// Uses the mutex-protected wrapper
-	sendReady(wrappedConn, hello.ServerID, connLogger)
+	if state.backendHealthy.Load() {
+		sendReady(wrappedConn, hello.ServerID, connLogger)
+	} else {
+		sendNotReady(wrappedConn, hello.ServerID, connLogger)
+	}
 
-	connLogger.Info().Msg("Connected to server")
+	connLogger.Info().Bool("backendHealthy", state.backendHealthy.Load()).Msg("Connected to server")
 
 	// Start handler in goroutine
 	go func() {
