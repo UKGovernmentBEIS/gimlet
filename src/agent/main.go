@@ -178,7 +178,19 @@ func sendReady(conn connection.WebSocketConn, serverID string, logger zerolog.Lo
 	if err := conn.WriteJSON(readyMsg); err != nil {
 		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send ready message to server")
 	} else {
-		logger.Info().Str("serverID", serverID).Msg("Sent ready message to server")
+		logger.Debug().Str("serverID", serverID).Msg("Sent ready message to server")
+	}
+}
+
+func sendNotReady(conn connection.WebSocketConn, serverID string, logger zerolog.Logger) {
+	notReadyMsg := messages.StateChangeMessage{
+		Type:  "not_ready",
+		State: "not_ready",
+	}
+	if err := conn.WriteJSON(notReadyMsg); err != nil {
+		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send not_ready message to server")
+	} else {
+		logger.Debug().Str("serverID", serverID).Msg("Sent not_ready message to server")
 	}
 }
 
@@ -190,7 +202,7 @@ func sendDraining(conn connection.WebSocketConn, serverID string, logger zerolog
 	if err := conn.WriteJSON(drainingMsg); err != nil {
 		logger.Error().Err(err).Str("serverID", serverID).Msg("Failed to send draining message to server")
 	} else {
-		logger.Info().Str("serverID", serverID).Msg("Sent draining message to server")
+		logger.Debug().Str("serverID", serverID).Msg("Sent draining message to server")
 	}
 }
 
