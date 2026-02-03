@@ -97,6 +97,14 @@ func main() {
 	baseLogger.Info().Dur("interval", cfg.ConnectionCheckInterval).Msg("Connection probe interval configured")
 	baseLogger.Info().Int("maxConcurrentRequests", cfg.MaxConcurrentRequests).Msg("Max concurrent requests per agent configured (0 = unlimited)")
 	baseLogger.Info().Int("bufferSize", cfg.RequestBufferSize).Msg("Request channel buffer size configured")
+	baseLogger.Info().
+		Str("url", cfg.HealthCheckURL()).
+		Dur("interval", cfg.HealthCheckInterval).
+		Dur("timeout", cfg.HealthCheckTimeout).
+		Str("codes", cfg.HealthCheckCodes).
+		Int("failureThreshold", cfg.HealthCheckFailureThreshold).
+		Int("successThreshold", cfg.HealthCheckSuccessThreshold).
+		Msg("Health check configured")
 
 	// Parse target URL to extract host:port for TCP connections
 	targetAddr := cfg.ParseTargetAddr()
