@@ -141,4 +141,5 @@ gen-jwts: gen-keys
 	@uv run gimlet jwt agent --subject agent-v1-2 --service model-v1 --duration 24h --private-key-file $(CREDS_DIR)/jwt-signing-key.pem > $(CREDS_DIR)/agent-v1-2.jwt
 	@uv run gimlet jwt agent --subject agent-v2-1 --service model-v2 --duration 24h --private-key-file $(CREDS_DIR)/jwt-signing-key.pem > $(CREDS_DIR)/agent-v2-1.jwt
 	@uv run gimlet jwt client --subject test-client --services "*" --duration 24h --private-key-file $(CREDS_DIR)/jwt-signing-key.pem > $(CREDS_DIR)/client.jwt
+	@uv run gimlet jwt client --subject status-client --services "*" --scope status --duration 24h --private-key-file $(CREDS_DIR)/jwt-signing-key.pem > $(CREDS_DIR)/status-client.jwt
 	@echo "✓ JWTs generated in $(CREDS_DIR)/"

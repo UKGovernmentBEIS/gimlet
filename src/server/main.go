@@ -294,7 +294,7 @@ func main() {
 	// Add health and status endpoints to main mux if no separate port configured
 	if cfg.HealthPort == "" {
 		mux.HandleFunc("/health", metrics.HealthHandler(cs))
-		mux.HandleFunc("/status", metrics.StatusHandler(cs))
+		mux.HandleFunc("/status", metrics.StatusHandler(cs, jwtValidator))
 	}
 
 	// Add metrics endpoint to main mux if no separate port configured
@@ -316,7 +316,7 @@ func main() {
 	if cfg.HealthPort != "" {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", metrics.HealthHandler(cs))
-		healthMux.HandleFunc("/status", metrics.StatusHandler(cs))
+		healthMux.HandleFunc("/status", metrics.StatusHandler(cs, jwtValidator))
 		go func() {
 			logger.Info().Str("port", cfg.HealthPort).Msg("Health endpoint listening")
 			if err := http.ListenAndServe(":"+cfg.HealthPort, healthMux); err != nil && err != http.ErrServerClosed {

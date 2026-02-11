@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
+
+	"gimlet/server/auth"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -253,9 +256,26 @@ func HealthHandler(server ServerInfo) http.HandlerFunc {
 	}
 }
 
-// StatusHandler returns a detailed JSON status endpoint handler
-func StatusHandler(server ServerInfo) http.HandlerFunc {
+// StatusHandler returns a detailed JSON status endpoint handler.
+// Requires a valid Gimlet token with the "status" scope.
+func StatusHandler(server ServerInfo, jwtValidator *auth.JWTValidator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Extract and validate Bearer token with "status" scope
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token == authHeader {
+			http.Error(w, "Invalid Authorization header format (use 'Bearer <token>')", http.StatusUnauthorized)
+			return
+		}
+		if _, err := jwtValidator.ValidateScopedJWT(token, "status"); err != nil {
+			http.Error(w, auth.SanitizeJWTError(err), http.StatusUnauthorized)
+			return
+		}
+
 		agentStatuses := server.AgentStatuses()
 
 		// Build per-service summary

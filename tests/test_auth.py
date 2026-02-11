@@ -447,5 +447,35 @@ def test_agent_duplicate_connection_rejected():
         ), f"Wrong error message: {error_response['error']}"
 
 
+def test_status_requires_auth():
+    """Test that /status without auth header returns 401."""
+    resp = requests.get(f"{BASE_URL}/status")
+    assert resp.status_code == 401
+    assert "Missing Authorization header" in resp.text
+
+
+def test_status_rejects_unscoped_token(auth_headers):
+    """Test that /status rejects a standard client JWT without status scope."""
+    resp = requests.get(f"{BASE_URL}/status", headers=auth_headers)
+    assert resp.status_code == 401
+
+
+def test_status_accepts_scoped_token(status_auth_headers):
+    """Test that /status accepts a JWT with the status scope."""
+    resp = requests.get(f"{BASE_URL}/status", headers=status_auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "server_id" in data
+    assert "services" in data
+
+
+def test_health_still_unauthenticated():
+    """Regression guard: /health should remain unauthenticated."""
+    resp = requests.get(f"{BASE_URL}/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "healthy"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
