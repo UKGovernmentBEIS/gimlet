@@ -133,6 +133,36 @@ func (cs *Server) AgentMetrics() []metrics.AgentMetricsSnapshot {
 	return snapshots
 }
 
+func (cs *Server) AgentStatuses() map[string][]metrics.AgentStatusSnapshot {
+	cs.agentsLock.RLock()
+	defer cs.agentsLock.RUnlock()
+
+	result := make(map[string][]metrics.AgentStatusSnapshot)
+	for _, ag := range cs.agents {
+		ag.MetricsLock.RLock()
+		draining := ag.Metrics.Draining
+		uptimeSeconds := ag.Metrics.ConnectionUptimeSeconds
+		backendFailures := ag.Metrics.BackendFailures
+		ag.MetricsLock.RUnlock()
+
+		cs.agentExpiryLock.RLock()
+		expiry := cs.agentExpiry[ag.ID]
+		cs.agentExpiryLock.RUnlock()
+
+		snap := metrics.AgentStatusSnapshot{
+			ID:                      ag.ID,
+			Ready:                   ag.IsReady(),
+			ActiveRequests:          ag.Load(),
+			Draining:                draining,
+			ConnectionUptimeSeconds: uptimeSeconds,
+			BackendFailures:         backendFailures,
+			TokenExpiresAt:          expiry,
+		}
+		result[ag.ServiceName] = append(result[ag.ServiceName], snap)
+	}
+	return result
+}
+
 // Implement handlers.MetricsTracker interface
 func (cs *Server) IncrementActiveRequests(service string) {
 	cs.metrics.ActiveRequests.WithLabelValues(service).Inc()
@@ -261,9 +291,10 @@ func main() {
 	}))
 	mux.HandleFunc("/agent", cs.handleAgentWebSocket)
 
-	// Add health endpoint to main mux if no separate port configured
+	// Add health and status endpoints to main mux if no separate port configured
 	if cfg.HealthPort == "" {
 		mux.HandleFunc("/health", metrics.HealthHandler(cs))
+		mux.HandleFunc("/status", metrics.StatusHandler(cs))
 	}
 
 	// Add metrics endpoint to main mux if no separate port configured
@@ -285,6 +316,7 @@ func main() {
 	if cfg.HealthPort != "" {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", metrics.HealthHandler(cs))
+		healthMux.HandleFunc("/status", metrics.StatusHandler(cs))
 		go func() {
 			logger.Info().Str("port", cfg.HealthPort).Msg("Health endpoint listening")
 			if err := http.ListenAndServe(":"+cfg.HealthPort, healthMux); err != nil && err != http.ErrServerClosed {

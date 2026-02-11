@@ -215,6 +215,17 @@ type AgentMetricsSnapshot struct {
 	ConnectionUptimeSeconds int64
 }
 
+// AgentStatusSnapshot holds the status of a single agent for the /status endpoint
+type AgentStatusSnapshot struct {
+	ID                      string    `json:"id"`
+	Ready                   bool      `json:"ready"`
+	ActiveRequests          int       `json:"active_requests"`
+	Draining                bool      `json:"draining"`
+	ConnectionUptimeSeconds int64     `json:"connection_uptime_seconds"`
+	BackendFailures         int64     `json:"backend_failures"`
+	TokenExpiresAt          time.Time `json:"token_expires_at,omitempty"`
+}
+
 // ServerInfo provides server state for health/metrics reporting
 type ServerInfo interface {
 	AgentCounts() map[string]int
@@ -223,6 +234,7 @@ type ServerInfo interface {
 	StartTime() time.Time
 	AgentBufferStats() []AgentBufferStat
 	AgentMetrics() []AgentMetricsSnapshot
+	AgentStatuses() map[string][]AgentStatusSnapshot
 }
 
 // HealthHandler returns a health check endpoint handler
@@ -238,6 +250,43 @@ func HealthHandler(server ServerInfo) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(health)
+	}
+}
+
+// StatusHandler returns a detailed JSON status endpoint handler
+func StatusHandler(server ServerInfo) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		agentStatuses := server.AgentStatuses()
+
+		// Build per-service summary
+		type serviceStatus struct {
+			AgentCount     int                   `json:"agent_count"`
+			ActiveRequests int                   `json:"active_requests"`
+			Agents         []AgentStatusSnapshot `json:"agents"`
+		}
+
+		services := make(map[string]serviceStatus, len(agentStatuses))
+		for svc, agents := range agentStatuses {
+			svcRequests := 0
+			for _, ag := range agents {
+				svcRequests += ag.ActiveRequests
+			}
+			services[svc] = serviceStatus{
+				AgentCount:     len(agents),
+				ActiveRequests: svcRequests,
+				Agents:         agents,
+			}
+		}
+
+		status := map[string]interface{}{
+			"server_id":       server.ServerID(),
+			"uptime":          time.Since(server.StartTime()).String(),
+			"active_requests": server.ActiveRequestCount(),
+			"services":        services,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
 	}
 }
 
