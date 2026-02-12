@@ -62,14 +62,17 @@ def jwt():
     help="JWT issuer claim (env: GIMLET_JWT_ISSUER)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
-def agent(subject, service, duration, private_key_file, kms_key_arn, issuer, json_output):
+@click.option("--scope", "scopes", multiple=True, help="Scope to include (repeatable, e.g., --scope status)")
+def agent(subject, service, duration, private_key_file, kms_key_arn, issuer, json_output, scopes):
     """Generate agent registration JWT (aud: gimlet-agent)."""
     _validate_signing_key_options(private_key_file, kms_key_arn)
 
+    scope_list = list(scopes) if scopes else None
+
     if kms_key_arn:
-        token = jwt_utils.generate_agent_jwt_kms(subject, service, duration, kms_key_arn, issuer)
+        token = jwt_utils.generate_agent_jwt_kms(subject, service, duration, kms_key_arn, issuer, scopes=scope_list)
     else:
-        token = jwt_utils.generate_agent_jwt(subject, service, duration, private_key_file, issuer)
+        token = jwt_utils.generate_agent_jwt(subject, service, duration, private_key_file, issuer, scopes=scope_list)
 
     if json_output:
         exp = datetime.now(timezone.utc) + jwt_utils.parse_duration(duration)
@@ -115,18 +118,20 @@ def agent(subject, service, duration, private_key_file, kms_key_arn, issuer, jso
     help="JWT issuer claim (env: GIMLET_JWT_ISSUER)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
-def client(subject, services, duration, private_key_file, kms_key_arn, issuer, json_output):
+@click.option("--scope", "scopes", multiple=True, help="Scope to include (repeatable, e.g., --scope status)")
+def client(subject, services, duration, private_key_file, kms_key_arn, issuer, json_output, scopes):
     """Generate client request JWT (aud: gimlet-client)."""
     _validate_signing_key_options(private_key_file, kms_key_arn)
 
     service_list = [s.strip() for s in services.split(",")]
+    scope_list = list(scopes) if scopes else None
 
     if kms_key_arn:
         token = jwt_utils.generate_client_jwt_kms(
-            subject, service_list, duration, kms_key_arn, issuer
+            subject, service_list, duration, kms_key_arn, issuer, scopes=scope_list
         )
     else:
-        token = jwt_utils.generate_client_jwt(subject, service_list, duration, private_key_file, issuer)
+        token = jwt_utils.generate_client_jwt(subject, service_list, duration, private_key_file, issuer, scopes=scope_list)
 
     if json_output:
         exp = datetime.now(timezone.utc) + jwt_utils.parse_duration(duration)

@@ -24,6 +24,21 @@ def auth_headers(client_jwt):
     return {"Authorization": f"Bearer {client_jwt}"}
 
 
+@pytest.fixture(scope="session")
+def status_jwt():
+    """Load status-scoped client JWT from file."""
+    jwt_path = Path(__file__).parent / "resources" / "credentials" / "status-client.jwt"
+    if not jwt_path.exists():
+        pytest.fail(f"Status JWT not found at {jwt_path}. Run 'make gen-jwts' first.")
+    return jwt_path.read_text().strip()
+
+
+@pytest.fixture(scope="session")
+def status_auth_headers(status_jwt):
+    """Return headers with status-scoped JWT authorization."""
+    return {"Authorization": f"Bearer {status_jwt}"}
+
+
 @pytest.fixture(scope="session", autouse=True)
 def wait_for_services(auth_headers):
     """

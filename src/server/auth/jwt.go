@@ -41,17 +41,31 @@ func SanitizeJWTError(err error) string {
 		return "Unsupported signing method"
 	}
 
+	// Check for scope-related errors
+	if strings.Contains(errStr, "missing required scope") {
+		return "Insufficient scope"
+	}
+
 	// Default: hide system config details
 	return "Unauthorized"
 }
 
 type AgentClaims struct {
-	Service string `json:"service"`
+	Service string   `json:"service"`
+	Scopes  []string `json:"scope,omitempty"`
 	jwt.RegisteredClaims
 }
 
 type ClientClaims struct {
 	Services []string `json:"services"`
+	Scopes   []string `json:"scope,omitempty"`
+	jwt.RegisteredClaims
+}
+
+// ScopedClaims parses any valid Gimlet token (agent or client) and extracts
+// only the scope claim + registered claims. Used by ValidateScopedJWT.
+type ScopedClaims struct {
+	Scopes []string `json:"scope,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -175,4 +189,68 @@ func (v *JWTValidator) ValidateClientJWT(tokenString string) (string, []string, 
 	}
 
 	return "", nil, time.Time{}, fmt.Errorf("invalid token: %w", lastErr)
+}
+
+// HasScope returns true if the required scope is present in the scopes slice.
+func HasScope(scopes []string, required string) bool {
+	for _, s := range scopes {
+		if s == required {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateScopedJWT validates any valid Gimlet token (agent or client audience)
+// and checks that the required scope is present.
+// Returns (subject, error).
+func (v *JWTValidator) ValidateScopedJWT(tokenString string, requiredScope string) (string, error) {
+	var lastErr error
+
+	for _, publicKey := range v.publicKeys {
+		token, err := jwt.ParseWithClaims(tokenString, &ScopedClaims{}, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return publicKey, nil
+		})
+
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		claims, ok := token.Claims.(*ScopedClaims)
+		if !ok || !token.Valid {
+			lastErr = fmt.Errorf("invalid token claims")
+			continue
+		}
+
+		// Validate issuer
+		if claims.Issuer != v.issuer {
+			return "", fmt.Errorf("invalid issuer: expected %s, got %s", v.issuer, claims.Issuer)
+		}
+
+		// Validate audience is one of the known Gimlet audiences
+		audience, err := claims.GetAudience()
+		if err != nil || len(audience) != 1 {
+			return "", fmt.Errorf("invalid audience")
+		}
+		if audience[0] != "gimlet-agent" && audience[0] != "gimlet-client" {
+			return "", fmt.Errorf("invalid audience: expected gimlet-agent or gimlet-client")
+		}
+
+		if claims.Subject == "" {
+			return "", fmt.Errorf("missing sub claim")
+		}
+
+		// Check required scope
+		if !HasScope(claims.Scopes, requiredScope) {
+			return "", fmt.Errorf("missing required scope: %s", requiredScope)
+		}
+
+		return claims.Subject, nil
+	}
+
+	return "", fmt.Errorf("invalid token: %w", lastErr)
 }

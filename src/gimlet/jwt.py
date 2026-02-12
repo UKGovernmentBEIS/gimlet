@@ -83,7 +83,12 @@ def parse_duration(s: str) -> timedelta:
 
 
 def generate_agent_jwt(
-    subject: str, service: str, duration: str, key_path: Path, issuer: str = "gimlet"
+    subject: str,
+    service: str,
+    duration: str,
+    key_path: Path,
+    issuer: str = "gimlet",
+    scopes: list[str] | None = None,
 ) -> str:
     """Generate agent JWT (aud: gimlet-agent)."""
     private_key = load_or_generate_keypair(key_path)
@@ -98,12 +103,19 @@ def generate_agent_jwt(
         "exp": int((now + parse_duration(duration)).timestamp()),
         "nbf": int(now.timestamp()),
     }
+    if scopes:
+        claims["scope"] = scopes
 
     return jwt.encode(claims, private_key, algorithm="RS256")
 
 
 def generate_client_jwt(
-    subject: str, services: list[str], duration: str, key_path: Path, issuer: str = "gimlet"
+    subject: str,
+    services: list[str],
+    duration: str,
+    key_path: Path,
+    issuer: str = "gimlet",
+    scopes: list[str] | None = None,
 ) -> str:
     """Generate client JWT (aud: gimlet-client)."""
     private_key = load_or_generate_keypair(key_path)
@@ -118,6 +130,8 @@ def generate_client_jwt(
         "exp": int((now + parse_duration(duration)).timestamp()),
         "nbf": int(now.timestamp()),
     }
+    if scopes:
+        claims["scope"] = scopes
 
     return jwt.encode(claims, private_key, algorithm="RS256")
 
@@ -220,7 +234,12 @@ def _build_jwt_with_kms(claims: dict, key_arn: str) -> str:
 
 
 def generate_agent_jwt_kms(
-    subject: str, service: str, duration: str, key_arn: str, issuer: str = "gimlet"
+    subject: str,
+    service: str,
+    duration: str,
+    key_arn: str,
+    issuer: str = "gimlet",
+    scopes: list[str] | None = None,
 ) -> str:
     """Generate agent JWT using KMS for signing (aud: gimlet-agent)."""
     now = datetime.now(timezone.utc)
@@ -234,12 +253,19 @@ def generate_agent_jwt_kms(
         "exp": int((now + parse_duration(duration)).timestamp()),
         "nbf": int(now.timestamp()),
     }
+    if scopes:
+        claims["scope"] = scopes
 
     return _build_jwt_with_kms(claims, key_arn)
 
 
 def generate_client_jwt_kms(
-    subject: str, services: list[str], duration: str, key_arn: str, issuer: str = "gimlet"
+    subject: str,
+    services: list[str],
+    duration: str,
+    key_arn: str,
+    issuer: str = "gimlet",
+    scopes: list[str] | None = None,
 ) -> str:
     """Generate client JWT using KMS for signing (aud: gimlet-client)."""
     now = datetime.now(timezone.utc)
@@ -253,5 +279,7 @@ def generate_client_jwt_kms(
         "exp": int((now + parse_duration(duration)).timestamp()),
         "nbf": int(now.timestamp()),
     }
+    if scopes:
+        claims["scope"] = scopes
 
     return _build_jwt_with_kms(claims, key_arn)
