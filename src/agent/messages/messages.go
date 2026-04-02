@@ -16,8 +16,8 @@ type HelloMessage struct {
 
 // StateChangeMessage is sent by agent to change its readiness state
 type StateChangeMessage struct {
-	Type  string `json:"type"`  // "ready" or "draining"
-	State string `json:"state"` // "ready" or "draining"
+	Type  string `json:"type"`  // "ready", "not_ready", or "draining"
+	State string `json:"state"` // "ready", "not_ready", or "draining"
 }
 
 // MetricsUpdate is sent periodically by agent to report connection-level metrics

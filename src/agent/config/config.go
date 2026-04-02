@@ -20,6 +20,14 @@ type Config struct {
 	RequestBufferSize       int
 	LogLevel                string
 	LogFormat               string
+
+	// Health check configuration
+	HealthCheckPath             string
+	HealthCheckInterval         time.Duration
+	HealthCheckTimeout          time.Duration
+	HealthCheckCodes            string // Raw string, parsed by health checker
+	HealthCheckFailureThreshold int
+	HealthCheckSuccessThreshold int
 }
 
 // flag values (populated by flag.Parse)
@@ -34,6 +42,14 @@ var (
 	flagRequestBufferSize       string
 	flagLogLevel                string
 	flagLogFormat               string
+
+	// Health check flags
+	flagHealthCheckPath             string
+	flagHealthCheckInterval         string
+	flagHealthCheckTimeout          string
+	flagHealthCheckCodes            string
+	flagHealthCheckFailureThreshold string
+	flagHealthCheckSuccessThreshold string
 )
 
 func init() {
@@ -57,6 +73,20 @@ func init() {
 		"Log level: DEBUG, INFO, WARN, ERROR (env: GIMLET_AGENT_LOG_LEVEL, GIMLET_LOG_LEVEL)")
 	flag.StringVar(&flagLogFormat, "log-format", "",
 		"Log format: json, console (env: GIMLET_AGENT_LOG_FORMAT, GIMLET_LOG_FORMAT)")
+
+	// Health check flags
+	flag.StringVar(&flagHealthCheckPath, "health-check-path", "",
+		"HTTP path for backend health checks (env: GIMLET_AGENT_HEALTH_CHECK_PATH)")
+	flag.StringVar(&flagHealthCheckInterval, "health-check-interval", "",
+		"Interval between health checks (env: GIMLET_AGENT_HEALTH_CHECK_INTERVAL)")
+	flag.StringVar(&flagHealthCheckTimeout, "health-check-timeout", "",
+		"Timeout for health check requests (env: GIMLET_AGENT_HEALTH_CHECK_TIMEOUT)")
+	flag.StringVar(&flagHealthCheckCodes, "health-check-codes", "",
+		"Accepted HTTP status codes, e.g. 200, 200-299, 200,204,301-399 (env: GIMLET_AGENT_HEALTH_CHECK_CODES)")
+	flag.StringVar(&flagHealthCheckFailureThreshold, "health-check-failure-threshold", "",
+		"Consecutive failures before marking backend unhealthy (env: GIMLET_AGENT_HEALTH_CHECK_FAILURE_THRESHOLD)")
+	flag.StringVar(&flagHealthCheckSuccessThreshold, "health-check-success-threshold", "",
+		"Consecutive successes before marking backend healthy (env: GIMLET_AGENT_HEALTH_CHECK_SUCCESS_THRESHOLD)")
 }
 
 // Load parses flags, reads env vars, applies defaults, and returns Config
@@ -84,6 +114,20 @@ func Load() *Config {
 			[]string{"GIMLET_AGENT_LOG_LEVEL", "GIMLET_LOG_LEVEL"}, "INFO"),
 		LogFormat: resolveString(flagLogFormat,
 			[]string{"GIMLET_AGENT_LOG_FORMAT", "GIMLET_LOG_FORMAT"}, "json"),
+
+		// Health check config
+		HealthCheckPath: resolveString(flagHealthCheckPath,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_PATH"}, "/health"),
+		HealthCheckInterval: resolveDuration(flagHealthCheckInterval,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_INTERVAL"}, 5*time.Second),
+		HealthCheckTimeout: resolveDuration(flagHealthCheckTimeout,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_TIMEOUT"}, 3*time.Second),
+		HealthCheckCodes: resolveString(flagHealthCheckCodes,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_CODES"}, "200-299"),
+		HealthCheckFailureThreshold: resolveInt(flagHealthCheckFailureThreshold,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_FAILURE_THRESHOLD"}, 2),
+		HealthCheckSuccessThreshold: resolveInt(flagHealthCheckSuccessThreshold,
+			[]string{"GIMLET_AGENT_HEALTH_CHECK_SUCCESS_THRESHOLD"}, 1),
 	}
 
 	return cfg
@@ -182,6 +226,16 @@ func (c *Config) ParseTargetAddr() string {
 	}
 
 	return addr
+}
+
+// HealthCheckURL returns the full URL for health checks
+func (c *Config) HealthCheckURL() string {
+	base := strings.TrimSuffix(c.TargetURL, "/")
+	path := c.HealthCheckPath
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
 }
 
 // ParseLogLevel converts log level string to a normalized form

@@ -1012,6 +1012,153 @@ def test_agent_shutdown_no_goroutine_leak():
     time.sleep(5)
 
 
+@pytest.mark.disruption
+@pytest.mark.xdist_group(name="serial_disruption")
+def test_agent_waits_for_healthy_backend():
+    """
+    Test that agent doesn't become ready until backend health check passes.
+
+    When backend is unavailable, agent should send not_ready to servers,
+    which means requests should fail with 503 (no agents available).
+    """
+    print("\n=== Testing agent waits for healthy backend ===")
+
+    # Verify initial state works
+    resp = _make_request("GET", "/headers", "model-v1")
+    assert resp.status_code == 200, "Initial request failed"
+    print("✓ Initial state healthy")
+
+    # Stop backend-v1 (httpbun)
+    print("Stopping backend-v1...")
+    backend = get_container("backend-v1-1")
+    backend.stop()
+
+    # Wait for health checks to fail and agents to become not_ready
+    # Health check interval is 2s, failure threshold is 2, so ~4-6s
+    print("Waiting for agents to detect unhealthy backend (10s)...")
+    time.sleep(10)
+
+    # Requests should now fail with 503 (no ready agents)
+    print("Verifying requests fail with 503...")
+    failure_count = 0
+    for i in range(5):
+        try:
+            resp = _make_request("GET", "/headers", "model-v1", timeout=3)
+            if resp.status_code == 503:
+                failure_count += 1
+                print(f"  Request {i + 1}: 503 (expected - no ready agents)")
+            else:
+                print(f"  Request {i + 1}: {resp.status_code} (unexpected)")
+        except Exception as e:
+            print(f"  Request {i + 1}: exception {e}")
+        time.sleep(0.5)
+
+    assert failure_count >= 3, (
+        f"Expected at least 3 requests to get 503, got {failure_count}"
+    )
+    print(f"✓ {failure_count}/5 requests correctly returned 503")
+
+    # Start backend-v1 again
+    print("Starting backend-v1...")
+    backend.start()
+
+    # Wait for health checks to pass and agents to become ready
+    print("Waiting for agents to detect healthy backend (10s)...")
+    time.sleep(10)
+
+    # Requests should now succeed
+    print("Verifying requests succeed again...")
+    success_count = 0
+    for i in range(5):
+        try:
+            resp = _make_request("GET", "/headers", "model-v1", timeout=3)
+            if resp.status_code == 200:
+                success_count += 1
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    assert success_count >= 4, (
+        f"Expected at least 4 successful requests, got {success_count}"
+    )
+    print(f"✓ {success_count}/5 requests succeeded after backend recovery")
+
+
+@pytest.mark.disruption
+@pytest.mark.xdist_group(name="serial_disruption")
+def test_agent_transitions_to_unhealthy_on_backend_failure():
+    """
+    Test that agent transitions from ready to not_ready when backend fails.
+
+    Start with healthy system, kill backend, verify agent becomes not_ready,
+    then restore backend and verify recovery.
+    """
+    print("\n=== Testing agent transitions to unhealthy on backend failure ===")
+
+    # Verify initial state works
+    print("Verifying initial healthy state...")
+    for i in range(3):
+        resp = _make_request("GET", "/headers", "model-v1")
+        assert resp.status_code == 200, f"Initial request {i + 1} failed"
+    print("✓ Initial state healthy")
+
+    # Kill backend-v1 (more aggressive than stop)
+    print("Killing backend-v1...")
+    backend = get_container("backend-v1-1")
+    backend.kill(signal="SIGKILL")
+
+    # Wait for health checks to fail
+    # With 2s interval and failure threshold of 2, should take ~4-6s
+    print("Waiting for health check failures to trigger not_ready (8s)...")
+    time.sleep(8)
+
+    # Verify requests fail
+    print("Verifying service unavailable...")
+    unavailable_count = 0
+    for i in range(5):
+        try:
+            resp = _make_request("GET", "/headers", "model-v1", timeout=3)
+            if resp.status_code in [502, 503, 504]:
+                unavailable_count += 1
+                print(f"  Request {i + 1}: {resp.status_code} (expected)")
+            else:
+                print(f"  Request {i + 1}: {resp.status_code}")
+        except Exception as e:
+            unavailable_count += 1
+            print(f"  Request {i + 1}: exception (expected)")
+        time.sleep(0.5)
+
+    assert unavailable_count >= 3, (
+        f"Expected at least 3 failed requests, got {unavailable_count}"
+    )
+    print(f"✓ {unavailable_count}/5 requests failed as expected")
+
+    # Start backend again
+    print("Starting backend-v1...")
+    backend.start()
+
+    # Wait for recovery
+    print("Waiting for health check recovery (10s)...")
+    time.sleep(10)
+
+    # Verify recovery
+    print("Verifying service recovered...")
+    success_count = 0
+    for i in range(5):
+        try:
+            resp = _make_request("GET", "/headers", "model-v1", timeout=3)
+            if resp.status_code == 200:
+                success_count += 1
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    assert success_count >= 4, (
+        f"Expected at least 4 successful requests after recovery, got {success_count}"
+    )
+    print(f"✓ {success_count}/5 requests succeeded - service recovered")
+
+
 if __name__ == "__main__":
     # Run all disruption tests
     pytest.main([__file__, "-v", "-m", "disruption"])
